@@ -1,0 +1,6 @@
+# inventory WITHOUT human-facing-prose entry
+exit= 1
+fm-doc-audience-check: unclassified: .agents/skills/human-facing-prose/SKILL.md
+# inventory restored
+exit= 0
+fm-doc-audience-check: ok surfaces=110 local_links=514

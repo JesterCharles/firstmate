@@ -1,0 +1,3 @@
+evidence section byte-identical: True
+summary words before/after: 67 49
+contains 'captain' in non-chat artifact: False

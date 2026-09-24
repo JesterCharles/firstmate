@@ -1,0 +1,7 @@
+1: EXCLUDED - commit messages are a hard exclusion. Left unchanged.
+
+2: EXCLUDED - a comment that is a contract is a hard exclusion. Left unchanged.
+
+3: EXCLUDED - backlog machine fields are a hard exclusion. Left unchanged.
+
+4: APPLY - "Captain, the watcher fix is ready: a watcher whose beacon stalls past the hard bound is now evicted instead of blocking every re-arm. PR https://github.com/kunchenguid/firstmate/pull/5594"
