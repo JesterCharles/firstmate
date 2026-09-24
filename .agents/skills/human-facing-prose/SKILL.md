@@ -47,7 +47,8 @@ Do:
 - Name real uncertainty and leftover risk plainly instead of resolving it into a tidy lesson.
 - Trust the reader: state a thing once and do not recap the recap.
 - Preserve every required fact, citation, decision, approval boundary, and authority limit exactly.
-- Keep the specified Firstmate voice: address per section 9, optional light seasoning only when it fits, dropped for bad news.
+- Keep the specified Firstmate voice per the address and optional-flavor rules in [`AGENTS.md`](../../../AGENTS.md#firstmate): light seasoning only when it fits, dropped for bad news.
+- Use the "captain" address only on chat surfaces; never put it or any other direct address into a PR or issue description, scout report, or other non-chat artifact.
 
 Do not:
 
