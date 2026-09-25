@@ -57,6 +57,54 @@ start_guard() {
     --attribution exact --no-monitor --now 1800000000 $remaining_args
 }
 
+procevent() {
+  local home=$1
+  shift
+  FM_ROOT_OVERRIDE="$ROOT" FM_HOME="$home" FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" \
+    FM_PROCEVENT_CLAIM_ROOT="$home/claims" "$ROOT/bin/fm-procevent.sh" "$@"
+}
+
+monitor_count() {
+  procevent "$1" list | grep -Ec '^resource-sample +resource +' || true
+}
+
+iso_epoch() {
+  date -u -r "$1" '+%Y-%m-%dT%H:%M:%SZ' 2>/dev/null || date -u -d "@$1" '+%Y-%m-%dT%H:%M:%SZ'
+}
+
+# A version-compatible quota-axi stand-in: FAKE_QUOTA_MODE=fail exits nonzero,
+# otherwise it prints FAKE_QUOTA_SNAPSHOT.
+make_fake_quota() {
+  local dir=$1
+  mkdir -p "$dir"
+  cat >"$dir/quota-axi" <<'SH'
+#!/usr/bin/env bash
+case "${1-}" in --version) echo "quota-axi 9.9.9"; exit 0 ;; esac
+[ "${FAKE_QUOTA_MODE:-ok}" = fail ] && exit 1
+cat "$FAKE_QUOTA_SNAPSHOT"
+SH
+  chmod +x "$dir/quota-axi"
+}
+
+run_captain_hold() {
+  local home=$1
+  shift
+  PATH="$home/fakebin:$PATH" REAL_TASKS_AXI="$TASKS_AXI_BIN" FM_HOME="$home" \
+    FM_STATE_OVERRIDE="$home/state" FM_DATA_OVERRIDE="$home/data" FM_CONFIG_OVERRIDE="$home/config" \
+    "$ROOT/bin/fm-captain-hold.sh" "$@"
+}
+
+# <home> <authority-task> <decision-file>: hold, bind, and answer one captain call.
+captain_answer() {
+  local home=$1 authority=$2 decision=$3
+  [ -f "$home/.tasks.toml" ] || cp "$ROOT/.tasks.toml" "$home/.tasks.toml"
+  [ -f "$home/data/backlog.md" ] || printf '## In flight\n\n## Queued\n\n## Done\n' >"$home/data/backlog.md"
+  (cd "$home" && tasks-axi add "$authority" "Approve revised resource budget" --kind scout --repo sample >/dev/null)
+  run_captain_hold "$home" hold "$authority" --reason "revised resource budget needed" >/dev/null
+  run_guard "$home" bind-authority sample "$authority" >/dev/null || fail "captain authority did not bind"
+  run_captain_hold "$home" answer "$authority" --decision-file "$decision" >/dev/null
+}
+
 expect_rc() {
   local expected=$1
   shift
@@ -292,6 +340,71 @@ jq -e '.state == "resumed" and .resume_authority == "auto_near_reset"' "$home/st
   || fail "automatic resume authority was not recorded"
 ok "pause waits for a worker boundary and only the proved near-reset rule resumes automatically"
 
+home=$(make_home stale-pause)
+write_snapshot "$home/far.json" 44 2027-01-15T15:00:00Z
+expect_rc 3 start_guard "$home" "$home/far.json"
+printf 'paused [at=1799999990]: an earlier unrelated pause\n' >"$home/state/sample.status"
+expect_rc 1 run_guard "$home" pause sample --now 1800000010
+printf 'paused: no boundary stamp\n' >>"$home/state/sample.status"
+expect_rc 1 run_guard "$home" pause sample --now 1800000011
+[ "$(jq -r .guard_state "$home/state/sample.resource-budget.json")" = pause_pending ] \
+  || fail "a paused event older than the pause request finalized the resource pause"
+printf 'paused [at=1800000012]: resource guard safe boundary reached\n' >>"$home/state/sample.status"
+run_guard "$home" pause sample --now 1800000013 >/dev/null || fail "fresh safe boundary did not finalize pause"
+ok "pause requires a paused boundary no older than the pause request"
+
+home=$(make_home monitor-read-failure)
+write_snapshot "$home/base.json" 80 2030-01-01T00:00:00Z
+start_guard "$home" "$home/base.json" >/dev/null
+make_fake_quota "$home/fakebin"
+out=$(PATH="$home/fakebin:$PATH" FAKE_QUOTA_MODE=fail run_guard "$home" monitor sample --interval 1) \
+  || fail "monitor failed on an unavailable quota read"
+printf '%s\n' "$out" | grep -qx 'status: pause-required' \
+  || fail "unavailable monitor telemetry did not request a cooperative pause: $out"
+jq -e '.guard_state == "pause_pending" and .decision_reason == "telemetry_unavailable" and
+  (.telemetry_reasons | index("telemetry_read_failed")) and
+  .windows[0].baseline_remaining_points == 80 and .windows[0].current_remaining_points == null' \
+  "$home/state/sample.resource-budget.json" >/dev/null \
+  || fail "monitor read failure did not pause over the last known baseline"
+printf '%s\n' "$out" >"$home/result"
+$ADAPTER terminal "$home/result" || fail "monitor telemetry pause was not a terminal wake"
+home=$(make_home monitor-malformed)
+write_snapshot "$home/base.json" 80 2030-01-01T00:00:00Z
+write_snapshot "$home/malformed.json" 70 not-a-time
+start_guard "$home" "$home/base.json" >/dev/null
+make_fake_quota "$home/fakebin"
+out=$(PATH="$home/fakebin:$PATH" FAKE_QUOTA_SNAPSHOT="$home/malformed.json" \
+  run_guard "$home" monitor sample --interval 1) || fail "monitor failed on malformed quota telemetry"
+printf '%s\n' "$out" | grep -qx 'status: pause-required' \
+  || fail "malformed monitor telemetry did not request a cooperative pause: $out"
+jq -e '.decision_reason == "telemetry_unavailable" and .windows[0].baseline_remaining_points == 80' \
+  "$home/state/sample.resource-budget.json" >/dev/null || fail "malformed monitor telemetry lost the baseline"
+ok "monitor-time unavailable or malformed telemetry pauses cooperatively instead of retiring unguarded"
+
+home=$(make_home monitor-near-reset)
+now_real=$(date +%s)
+reset_epoch=$((now_real + 10800))
+write_snapshot "$home/near.json" 30 "$(iso_epoch "$reset_epoch")"
+start_epoch=$((reset_epoch - 25200))
+expect_rc 3 run_guard "$home" start sample --provider codex --snapshot "$home/near.json" \
+  --attribution exact --interval 1 --now "$start_epoch"
+printf 'paused [at=%s]: resource guard safe boundary reached\n' "$((start_epoch + 1))" >"$home/state/sample.status"
+run_guard "$home" pause sample --now "$((start_epoch + 2))" >/dev/null || fail "reserve pause did not finalize"
+[ "$(monitor_count "$home")" = 1 ] || fail "finalized reserve pause left no monitor to prove near-reset resume"
+make_fake_quota "$home/fakebin"
+out=$(PATH="$home/fakebin:$PATH" FAKE_QUOTA_SNAPSHOT="$home/near.json" run_guard "$home" monitor sample --interval 1) \
+  || fail "paused-reserve monitor failed"
+printf '%s\n' "$out" | grep -qx 'status: resumed' || fail "monitor did not report the near-reset resume: $out"
+jq -e '.guard_state == "active" and .decision_reason == null' "$home/state/sample.resource-budget.json" >/dev/null \
+  || fail "monitor near-reset proof did not reopen the budget"
+printf '%s\n' "$out" >"$home/result"
+[ "$($ADAPTER classify "$home/result")" = resumed ] || fail "resume result was not classified"
+if $ADAPTER terminal "$home/result"; then
+  fail "a resumed budget retired its own monitor"
+fi
+[ "$(monitor_count "$home")" = 1 ] || fail "near-reset resume duplicated or dropped the monitor"
+ok "a reserve pause keeps one monitor armed and its near-reset proof resumes without retiring it"
+
 home=$(make_home review)
 write_snapshot "$home/base.json" 80 2030-01-01T00:00:00Z
 start_guard "$home" "$home/base.json" >/dev/null
@@ -321,6 +434,47 @@ jq -e '.guard_state == "active" and .review.final.scope == "full" and .review.fi
   || fail "redesign and final independent review were not recorded"
 ok "bounded review stops same-theme loops and permits an explicit redesign with final full review"
 
+home=$(make_home review-bound)
+write_snapshot "$home/base.json" 80 2030-01-01T00:00:00Z
+run_guard "$home" start sample --provider codex --snapshot "$home/base.json" --attribution exact \
+  --interval 1 --now 1800000000 >/dev/null
+[ "$(monitor_count "$home")" = 1 ] || fail "healthy start did not arm the monitor"
+# The process-event runner retires a terminal pause result's source itself.
+procevent "$home" retire resource-sample >/dev/null
+[ "$(monitor_count "$home")" = 0 ] || fail "could not simulate a retired terminal monitor"
+review_args='--provider claude --family sonnet'
+run_guard "$home" review sample creator --head aaaaaaa --actor creator-1 --provider codex --family gpt5 --now 1800000010 >/dev/null
+# shellcheck disable=SC2086
+run_guard "$home" review sample critic --head aaaaaaa --actor critic-1 $review_args --now 1800000020 >/dev/null
+# shellcheck disable=SC2086
+run_guard "$home" review sample failure --head aaaaaaa --actor critic-1 $review_args --theme theme-a --now 1800000030 >/dev/null
+run_guard "$home" review sample correction --head bbbbbbb --actor creator-1 --provider codex --family gpt5 --theme theme-a --now 1800000040 >/dev/null
+# shellcheck disable=SC2086
+expect_rc 1 run_guard "$home" review sample delta --head ccccccc --actor critic-1 $review_args --now 1800000050
+# shellcheck disable=SC2086
+run_guard "$home" review sample delta --head bbbbbbb --actor critic-1 $review_args --now 1800000050 >/dev/null \
+  || fail "focused delta of the correction head was refused"
+# shellcheck disable=SC2086
+run_guard "$home" review sample delta --head bbbbbbb --actor critic-1 $review_args --now 1800000050 >/dev/null \
+  || fail "exact delta replay was not idempotent"
+# shellcheck disable=SC2086
+expect_rc 1 run_guard "$home" review sample delta --head bbbbbbb --actor critic-3 $review_args --now 1800000055
+# shellcheck disable=SC2086
+expect_rc 3 run_guard "$home" review sample failure --head bbbbbbb --actor critic-1 $review_args --theme theme-b --now 1800000060
+jq -e '.guard_state == "pause_pending" and .decision_reason == "review_loop_exhausted" and
+  .review.post_correction_failures == 1 and (.review.deltas | length) == 1' \
+  "$home/state/sample.resource-budget.json" >/dev/null \
+  || fail "an alternating-theme failure after the correction did not stop the loop"
+printf 'paused [at=1800000061]: resource guard safe boundary reached\n' >"$home/state/sample.status"
+run_guard "$home" pause sample --now 1800000062 >/dev/null
+[ "$(monitor_count "$home")" = 0 ] || fail "a captain-held pause armed a monitor"
+run_guard "$home" review sample rescope --head ddddddd --actor creator-2 --provider codex --family gpt5 --theme theme-b --now 1800000070 >/dev/null \
+  || fail "re-scope did not resolve the exhausted review loop"
+jq -e '.guard_state == "active" and .review.post_correction_failures == 0' \
+  "$home/state/sample.resource-budget.json" >/dev/null || fail "re-scope did not reset the review bound"
+[ "$(monitor_count "$home")" = 1 ] || fail "re-scope back to active did not re-arm exactly one monitor"
+ok "delta review is bounded to one pass and any post-correction failure stops alternating-theme loops"
+
 home=$(make_home hostile)
 write_snapshot "$home/base.json" 80 2030-01-01T00:00:00Z
 start_guard "$home" "$home/base.json" >/dev/null
@@ -331,6 +485,25 @@ expect_rc 1 run_guard "$home" milestone sample --type checks-green --snapshot "$
 [ "$(jq -r .guard_state "$home/state/sample.resource-budget.json")" = active ] \
   || fail "hostile journal partially published a budget decision"
 ok "hostile and corrupt local events are inert and block partial publication"
+
+home=$(make_home forged-event)
+write_snapshot "$home/base.json" 80 2030-01-01T00:00:00Z
+start_guard "$home" "$home/base.json" >/dev/null
+run_guard "$home" milestone sample --type checks-green --snapshot "$home/base.json" --now 1800000050 >/dev/null
+events="$home/data/resource-events/2027-01.jsonl"
+jq -c 'if .kind == "task_baseline" then .kind = "forged" else . end' "$events" >"$home/forged"
+cp "$home/forged" "$events"
+cp "$home/state/sample.resource-budget.json" "$home/before-forged.json"
+expect_rc 1 run_guard "$home" milestone sample --type report-accepted --snapshot "$home/base.json" --now 1800000100
+cmp -s "$home/before-forged.json" "$home/state/sample.resource-budget.json" \
+  || fail "a forged event with a stale digest was accepted by a later append"
+ok "event digests are re-verified whenever the journal changes outside the guard"
+
+home=$(make_home overlay-refusal)
+write_snapshot "$home/far.json" 44 2027-01-15T15:00:00Z
+expect_rc 3 start_guard "$home" "$home/far.json"
+expect_rc 3 run_guard "$home" worker-overlay sample
+ok "a non-active budget refuses the guarded worker overlay"
 
 home=$(make_home privacy)
 write_snapshot "$home/base.json" 80 2030-01-01T00:00:00Z
@@ -384,6 +557,41 @@ EOF
   expect_rc 1 run_guard "$home" resume sample --authority-task resource-call --decision-file "$home/drift.txt" \
     --snapshot "$home/burn.json" --now 1800000300
   ok "resume spends one exact durable captain answer without copying its text"
+
+  home=$(make_home authority-rebaseline)
+  write_snapshot "$home/base.json" 80 2030-01-01T00:00:00Z
+  write_snapshot "$home/reset.json" 95 2031-01-01T00:00:00Z
+  jq -n '{schemaVersion:5,providers:[{provider:"codex",quotaSemantics:{status:"unknown",effectiveAvailability:[]},windows:[]}]}' \
+    >"$home/unavailable.json"
+  run_guard "$home" start sample --provider codex --snapshot "$home/base.json" --attribution exact \
+    --interval 1 --now 1800000000 >/dev/null
+  procevent "$home" retire resource-sample >/dev/null
+  expect_rc 3 run_guard "$home" check sample --snapshot "$home/reset.json" --now 1800000100
+  printf 'paused [at=1800000101]: resource guard safe boundary reached\n' >"$home/state/sample.status"
+  run_guard "$home" pause sample --now 1800000102 >/dev/null
+  expect_rc 3 run_guard "$home" check sample --snapshot "$home/reset.json" --now 1800000150
+  jq -e '.guard_state == "paused" and .windows[0].reset_continuity == false and
+    .windows[0].resets_at == "2030-01-01T00:00:00Z" and .windows[0].burn_points == null' \
+    "$home/state/sample.resource-budget.json" >/dev/null \
+    || fail "a repeated post-reset check healed the discontinuity or reopened the pause"
+  printf 'resource_budget_points=15\n' >"$home/decision.txt"
+  captain_answer "$home" reset-call "$home/decision.txt"
+  expect_rc 1 run_guard "$home" resume sample --authority-task reset-call --decision-file "$home/decision.txt" \
+    --snapshot "$home/unavailable.json" --now 1800000200
+  [ "$(jq -r .guard_state "$home/state/sample.resource-budget.json")" = paused ] \
+    || fail "unavailable telemetry established an invented baseline"
+  run_guard "$home" resume sample --authority-task reset-call --decision-file "$home/decision.txt" \
+    --snapshot "$home/reset.json" --now 1800000300 >/dev/null \
+    || fail "an exact captain answer could not resume a reset-discontinuous pause"
+  jq -e '.guard_state == "active" and .revision == 2 and .telemetry_status == "known" and
+    .baseline_telemetry_reasons == [] and
+    .windows[0].baseline_remaining_points == 95 and .windows[0].resets_at == "2031-01-01T00:00:00Z" and
+    .windows[0].burn_points == 0 and (.rebaselines | length) == 1 and
+    (.rebaselines[0].discarded_reasons | index("window_reset_changed"))' \
+    "$home/state/sample.resource-budget.json" >/dev/null \
+    || fail "captain resume did not start a fresh versioned baseline from current telemetry"
+  [ "$(monitor_count "$home")" = 1 ] || fail "captain resume did not re-arm exactly one monitor"
+  ok "a captain answer rebaselines reset-discontinuous telemetry and re-arms one monitor"
 else
   ok "captain-authority integration skipped because tasks-axi is unavailable"
 fi

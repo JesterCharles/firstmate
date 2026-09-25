@@ -25,8 +25,9 @@
 #   Every ship or scout spawn renders `launch-brief.md`; when this home already
 #   carries state/<id>.resource-budget.json, the same harness-independent overlay
 #   also carries bin/fm-resource-guard.sh's cooperative safe-boundary contract.
-#   The budget is created before dispatch, and an unsafe or corrupt record stops
-#   the spawn instead of launching an unguarded heavy lane. For a no-mistakes
+#   The budget is created before dispatch, and an unsafe or corrupt record, or
+#   one that is not active, stops the spawn instead of launching an unguarded
+#   or paused heavy lane. For a no-mistakes
 #   ship the launch brief also carries the current `--intent` contract and the
 #   extracted captain intent. A legacy mixed Task is accepted there only under
 #   bin/fm-dod-lib.sh's
@@ -2864,11 +2865,16 @@ if [ "$KIND" = ship ] || [ "$KIND" = scout ]; then
   # firstmate may follow it and accidentally become captain intent.
   RESOURCE_OVERLAY=
   if [ -e "$STATE/$ID.resource-budget.json" ] || [ -L "$STATE/$ID.resource-budget.json" ]; then
+    RESOURCE_RC=0
     RESOURCE_OVERLAY=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_DATA_OVERRIDE="$DATA" \
-      "$SCRIPT_DIR/fm-resource-guard.sh" worker-overlay "$ID") || {
+      "$SCRIPT_DIR/fm-resource-guard.sh" worker-overlay "$ID") || RESOURCE_RC=$?
+    if [ "$RESOURCE_RC" -eq 3 ]; then
+      echo "error: task $ID's resource budget is paused or pending a pause; refusing to launch it until the guard authorizes resume" >&2
+      exit 1
+    elif [ "$RESOURCE_RC" -ne 0 ]; then
       echo "error: task $ID has an unsafe or corrupt resource budget; refusing to launch it unguarded" >&2
       exit 1
-    }
+    fi
   fi
   SOURCE_BRIEF=$BRIEF
   BRIEF="$DATA/$ID/launch-brief.md"

@@ -7,7 +7,7 @@
 #     [--tranche-points <points>] [--attribution <exact|dominant|shared|unknown>]
 #     [--concurrent-task <task-id>]... [--interval <seconds>] [--no-monitor]
 #     [--now <epoch>]
-#   fm-resource-guard.sh check <task-id> [--snapshot <path|->] [--now <epoch>]
+#   fm-resource-guard.sh check <task-id> [--snapshot <path|->] [--monitor] [--now <epoch>]
 #   fm-resource-guard.sh milestone <task-id> --type <checks-green|report-accepted|branch-landed|pr-merged>
 #     [--snapshot <path|->] [--now <epoch>]
 #   fm-resource-guard.sh pause <task-id> [--now <epoch>]
@@ -42,13 +42,19 @@
 #
 # `check` performs one deterministic evaluation. A missing, ambiguous, stale,
 # or malformed measurement becomes telemetry_unavailable rather than an
-# invented percentage. A known reserve crossing, 15-point burn, abnormal burn,
+# invented percentage. Under `--monitor` a failed or malformed quota read is
+# recorded as a telemetry_read_failed pause over the last known baseline; a
+# plain check refuses it without mutating state. A known reserve crossing, 15-point burn, abnormal burn,
 # shared/unknown-attribution threshold, unavailable telemetry, or bounded-review
 # circuit breaker creates a durable pause-pending record and evaluation. The
 # monitor only wakes supervision; it never interrupts a worker or a branch-owning
 # validation run. `pause` finalizes the stop only after the worker's own latest
-# status event says `paused`, which is the supported safe ownership boundary.
-# It never invokes interrupt, stash, reset, checkout, clean, or force.
+# status event says `paused` with an [at=<epoch>] no older than the pause
+# request, which is the supported safe ownership boundary. It never invokes
+# interrupt, stash, reset, checkout, clean, or force. Every authorized return to
+# active (captain resume, near-reset auto-resume, redesign, re-scope) re-arms
+# the one per-task monitor registration, and a finalized reserve pause keeps it
+# armed so the near-reset proof stays observable.
 #
 # A finalized ordinary reserve pause may auto-resume only when a later check
 # proves that a 15/5 near-reset floor makes the remaining bounded tranche safe.
@@ -57,15 +63,20 @@
 # supplied decision file has the same durable digest, and reads exactly one
 # `resource_budget_points=<number>` line (plus an optional
 # `resource_tranche_points=<number>` line) from those captain words. Reserve
-# floors never change through a revised budget. No prompt, chat, credential,
+# floors never change through a revised budget. When the pause is unavailable
+# or reset-discontinuous telemetry, that captain answer also starts a fresh
+# versioned baseline from current valid telemetry; it refuses when the current
+# snapshot cannot establish one. No prompt, chat, credential,
 # token stream, decision text, or project content is copied into guard state.
 #
 # The review ledger enforces one creator pass, one independent critic pass, one
-# accepted correction pass, focused delta review on intermediate heads, and an
-# independent full review of the final head. A second consecutive failure with
-# the same privacy-safe theme pauses the lane. Another same-theme loop is
-# refused until `redesign` or `rescope` is recorded, or the ordinary captain
-# resume path supplies a revised budget. Review records contain only actor ids,
+# accepted correction pass, one focused delta review of the corrected head, and
+# an independent full review of the final head. A second consecutive failure
+# with the same privacy-safe theme pauses the lane (repeated_review_theme), and
+# any failure after the correction pauses it (review_loop_exhausted), so
+# alternating themes cannot loop. Either stop is refused further review until
+# `redesign` or `rescope` is recorded, or the ordinary captain resume path
+# supplies a revised budget. Review records contain only actor ids,
 # theme slugs, and exact heads.
 #
 # Private local records:
@@ -445,6 +456,7 @@ build_baseline_budget() {
         final: null,
         last_failure_theme: null,
         consecutive_same_theme_failures: 0,
+        post_correction_failures: 0,
         redesigns: [],
         captain_budget_revisions: []
       }
@@ -455,13 +467,15 @@ build_baseline_budget() {
 # Evaluate the current concrete windows against the task baseline. This pure jq
 # program is the single numeric policy boundary used by start/check/monitor.
 evaluate_budget() {
-  local budget=$1 now=$2 kind=$3 milestone=${4:-}
+  local budget=$1 now=$2 kind=$3 milestone=${4:-} failure=${5:-} snapshot
   local ts
   ts=$(epoch_iso "$now") || die "cannot render timestamp"
-  printf '%s\n%s\n' "$budget" "$SNAPSHOT" | jq -sce \
+  snapshot=${SNAPSHOT-}
+  [ -z "$failure" ] || snapshot='{}'
+  printf '%s\n%s\n' "$budget" "$snapshot" | jq -sce \
     --arg event_schema "$EVENT_SCHEMA" --arg eval_schema "$EVALUATION_SCHEMA" \
     --arg pause_schema "$PAUSE_SCHEMA" --arg kind "$kind" --arg milestone "$milestone" \
-    --arg ts "$ts" --argjson now "$now" '
+    --arg failure "$failure" --arg ts "$ts" --argjson now "$now" '
     .[0] as $b | .[1] as $s |
     def row:
       ([$s.providers[] | select(.provider == $b.provider)]) as $rows |
@@ -516,7 +530,8 @@ evaluate_budget() {
         label: $base.label,
         baseline_remaining_points: $base.baseline_remaining_points,
         current_remaining_points: $remaining,
-        resets_at: $reset,
+        resets_at: $base.resets_at,
+        current_resets_at: $reset,
         seconds_to_reset: $to_reset,
         applicable_scopes: $base.applicable_scopes,
         runway_statuses: $runways,
@@ -529,10 +544,13 @@ evaluate_budget() {
           $w != null and $reset_continuity and ($remaining | type) == "number" and
           ($scopes | length) > 0 and all($scopes[]; .status == "known"))
       };
-    row as $r |
-    (if $r == null then [] else [$b.windows[] | window_eval($r; .)] end) as $windows |
+    (if $failure != "" then null else row end) as $r |
+    (if $failure != "" then
+       [$b.windows[] | . + {current_remaining_points: null, burn_points: null, telemetry_known: false}]
+     elif $r == null then [] else [$b.windows[] | window_eval($r; .)] end) as $windows |
     ([
-      (if $r == null then "provider_or_account_ambiguous" else empty end),
+      (if $failure != "" then $failure
+       elif $r == null then "provider_or_account_ambiguous" else empty end),
       (if ($windows | length) != ($b.windows | length) then "concrete_window_unavailable" else empty end),
       (if any($windows[]?; .reset_continuity == false) then "window_reset_changed" else empty end),
       (if any($windows[]?; .telemetry_known == false) then "window_telemetry_unavailable" else empty end)
@@ -648,11 +666,37 @@ event_file_for_ts() {
   printf '%s/resource-events/%s.jsonl' "$DATA" "$month"
 }
 
+journal_seal_path() { printf '%s/.%s.sha256' "${1%/*}" "${1##*/}"; }
+
+# Record the whole-file digest of a journal whose every line was just verified
+# or written here, so later appends re-verify per-line event ids only when the
+# journal bytes changed outside this owner.
+journal_seal() {
+  local path=$1 seal tmp
+  seal=$(journal_seal_path "$path")
+  safe_regular_or_absent "$seal" || die "refusing unsafe resource event seal: $seal"
+  if [ ! -e "$path" ]; then
+    rm -f "$seal" || die "cannot retire resource event seal: $seal"
+    return 0
+  fi
+  tmp=$(umask 077; mktemp "${path%/*}/.seal.XXXXXX") || die "cannot stage resource event seal"
+  sha256_file "$path" >"$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$seal" \
+    || { rm -f "$tmp"; die "cannot publish resource event seal: $seal"; }
+}
+
+journal_sealed() {
+  local path=$1 seal
+  seal=$(journal_seal_path "$path")
+  [ -f "$seal" ] && [ ! -L "$seal" ] && [ -O "$seal" ] || return 1
+  [ "$(cat "$seal" 2>/dev/null)" = "$(sha256_file "$path")" ]
+}
+
 validate_event_journal() {
-  local path=$1 line canonical expected actual
+  local path=$1
   safe_regular_or_absent "$path" || return 1
   [ -e "$path" ] || return 0
   [ "$(wc -c <"$path" | tr -d ' ')" -le 10485760 ] || return 1
+  journal_sealed "$path" && return 0
   jq -Rse --arg schema "$EVENT_SCHEMA" '
     split("\n")[:-1] as $lines |
     ($lines | length) > 0 and
@@ -666,12 +710,11 @@ validate_event_journal() {
        ($e.kind | type) == "string" and
        ($e.task_id | type) == "string"))
   ' "$path" >/dev/null 2>&1 || return 1
-  while IFS= read -r line; do
-    canonical=$(printf '%s\n' "$line" | jq -cS 'del(.event_id)') || return 1
-    expected=$(sha256_text "$canonical")
-    actual=$(printf '%s\n' "$line" | jq -r '.event_id') || return 1
-    [ "$expected" = "$actual" ] || return 1
-  done <"$path"
+  paste <(jq -r '.event_id' "$path") <(jq -cS 'del(.event_id)' "$path") |
+    while IFS=$'\t' read -r actual canonical; do
+      [ -n "$canonical" ] && [ "$(sha256_text "$canonical")" = "$actual" ] || exit 1
+    done || return 1
+  journal_seal "$path"
 }
 
 prune_event_retention() {
@@ -690,9 +733,13 @@ prune_event_retention() {
     count=$(wc -c <"$tmp" | tr -d ' ')
     if [ "$count" -eq 0 ]; then
       rm -f "$tmp" "$path" || die "cannot retire expired resource events"
+    elif cmp -s "$tmp" "$path"; then
+      rm -f "$tmp"
+      continue
     else
       mv -f "$tmp" "$path" || { rm -f "$tmp"; die "cannot publish retained resource events"; }
     fi
+    journal_seal "$path"
   done
 }
 
@@ -720,6 +767,7 @@ append_event() {
   printf '%s\n' "$event" >>"$tmp" || { rm -f "$tmp"; die "cannot stage resource event"; }
   chmod 600 "$tmp" || { rm -f "$tmp"; die "cannot protect resource event journal"; }
   mv -f "$tmp" "$path" || { rm -f "$tmp"; die "cannot publish resource event journal"; }
+  journal_seal "$path"
   EVENT_ID=$id
   event_lock_release
 }
@@ -769,6 +817,9 @@ apply_evaluation() {
   fi
   atomic_json_write "$(budget_path "$id")" "$budget"
   BUDGET=$budget
+  if [ "$(printf '%s\n' "$result" | jq -r '.decision.auto_resumed')" = true ] && [ "$MONITOR_MODE" != 1 ]; then
+    rearm_monitor "$id"
+  fi
   printf '%s\n' "$result" | jq -c '.decision'
   [ "$state" = active ] && return 0
   return 3
@@ -780,6 +831,14 @@ register_monitor() {
   "$SCRIPT_DIR/fm-procevent.sh" register resource "$source" -- \
     "$SCRIPT_DIR/fm-procevent-resource.sh" poll "$id" --interval "$interval" >/dev/null \
     || die "cannot register resource monitor for task $id"
+}
+
+# One registration per task source id: re-registering the same argv replaces
+# the record rather than adding a second monitor.
+rearm_monitor() {
+  local id=$1
+  [ "$(printf '%s\n' "$BUDGET" | jq -r 'if .monitor_enabled == false then "off" else "on" end')" = on ] || return 0
+  register_monitor "$id" "$(printf '%s\n' "$BUDGET" | jq -r '.monitor_interval_seconds')"
 }
 
 cmd_start() {
@@ -831,6 +890,8 @@ cmd_start() {
   fi
   budget=$(build_baseline_budget "$id" "$provider" "$account" "$model" "$scopes_json" \
     "$attribution" "$concurrent_json" "$tranche" "$interval" "$now")
+  budget=$(printf '%s\n' "$budget" | jq -c --argjson enabled "$([ "$no_monitor" = 1 ] && echo false || echo true)" \
+    '.monitor_enabled=$enabled')
 
   lock_acquire "$id"
   if [ -e "$(budget_path "$id")" ]; then
@@ -854,6 +915,7 @@ cmd_start() {
   return 3
 }
 
+MONITOR_MODE=0
 parse_snapshot_now() {
   SNAPSHOT_ARG=
   NOW_ARG=
@@ -861,21 +923,32 @@ parse_snapshot_now() {
     case "$1" in
       --snapshot) [ -n "${2-}" ] || die "--snapshot needs a path"; SNAPSHOT_ARG=$2; shift 2 ;;
       --now) NOW_ARG=${2-}; shift 2 ;;
+      --monitor) MONITOR_MODE=1; shift ;;
       *) usage ;;
     esac
   done
 }
 
 cmd_check() {
-  local id=${1:-} now result
+  local id=${1:-} now result snapshot failure=''
   slug_valid "$id" || die "task id must be a privacy-safe slug"
   shift || true
   parse_snapshot_now "$@"
   now=$(now_resolve "$NOW_ARG")
-  snapshot_read "$SNAPSHOT_ARG"
+  if [ "$MONITOR_MODE" = 1 ]; then
+    # A monitor must never retire on a bad read while the budget stays active:
+    # unavailable or malformed telemetry becomes a cooperative pause instead.
+    if snapshot=$(snapshot_read "$SNAPSHOT_ARG" 2>/dev/null && printf '%s' "$SNAPSHOT"); then
+      SNAPSHOT=$snapshot
+    else
+      failure=telemetry_read_failed
+    fi
+  else
+    snapshot_read "$SNAPSHOT_ARG"
+  fi
   lock_acquire "$id"
   load_budget "$id"
-  result=$(evaluate_budget "$BUDGET" "$now" window_snapshot)
+  result=$(evaluate_budget "$BUDGET" "$now" window_snapshot '' "$failure")
   apply_evaluation "$id" "$result" 0
 }
 
@@ -900,19 +973,23 @@ cmd_milestone() {
   apply_evaluation "$id" "$result" 1
 }
 
-latest_status_verb() {
+# Prints "<verb> <at-epoch>" for the newest status event; the epoch is empty
+# when that event carries no [at=<epoch>] stamp.
+latest_status_event() {
   local path=$1
   [ -f "$path" ] || return 1
   awk '
     /^[[:space:]]*(working|needs-decision|blocked|paused|done|failed|resolved)([[:space:]]+\[|[[:space:]]*:)/ {
-      line=$0; sub(/^[[:space:]]*/, "", line); sub(/[[:space:]:\[].*$/, "", line); verb=line
+      line=$0; sub(/^[[:space:]]*/, "", line); v=line; sub(/[[:space:]:\[].*$/, "", v); verb=v
+      at=""
+      if (match(line, /\[at=[0-9]+\]/)) at=substr(line, RSTART + 4, RLENGTH - 5)
     }
-    END { if (verb != "") print verb; else exit 1 }
+    END { if (verb != "") print verb " " at; else exit 1 }
   ' "$path"
 }
 
 cmd_pause() {
-  local id=${1:-} now_arg='' now budget pause event status_verb ts
+  local id=${1:-} now_arg='' now budget pause event status_verb='' status_at='' requested ts
   slug_valid "$id" || die "task id must be a privacy-safe slug"
   shift || true
   while [ "$#" -gt 0 ]; do
@@ -924,11 +1001,15 @@ cmd_pause() {
   load_budget "$id"
   [ "$(printf '%s\n' "$BUDGET" | jq -r '.guard_state')" = pause_pending ] \
     || die "task $id has no resource pause pending"
-  status_verb=$(latest_status_verb "$STATE/$id.status" || true)
+  read -r status_verb status_at <<<"$(latest_status_event "$STATE/$id.status" || true)" || true
   [ "$status_verb" = paused ] \
     || die "task $id has not reported a safe paused boundary; no lifecycle action was taken"
   pause=$(jq -ce --arg schema "$PAUSE_SCHEMA" --arg task "$id" 'select(.schema == $schema and .task_id == $task)' \
     "$(pause_path "$id")" 2>/dev/null) || die "resource pause record is corrupt for task $id"
+  requested=$(printf '%s\n' "$pause" | jq -er '.requested_at | fromdateiso8601') \
+    || die "resource pause record has no request time for task $id"
+  epoch_valid "$status_at" && [ "$status_at" -ge "$requested" ] \
+    || die "task $id's paused event predates the resource pause request; no lifecycle action was taken"
   budget=$(printf '%s\n' "$BUDGET" | jq -c --arg ts "$ts" '.guard_state="paused" | .paused_at=$ts')
   event=$(printf '%s\n' "$budget" | jq -c --arg schema "$EVENT_SCHEMA" --arg ts "$ts" '
     {
@@ -946,6 +1027,12 @@ cmd_pause() {
     '.state="paused" | .safe_boundary="worker_reported" | .paused_at=$ts | .pause_event_id=$event')
   atomic_json_write "$(pause_path "$id")" "$pause"
   atomic_json_write "$(budget_path "$id")" "$budget"
+  BUDGET=$budget
+  # Only the proven near-reset rule can reopen a reserve pause, so keep one
+  # monitor watching for that proof.
+  if [ "$(printf '%s\n' "$budget" | jq -r '.decision_reason')" = reserve_floor ]; then
+    rearm_monitor "$id"
+  fi
   printf 'paused: %s reason=%s\n' "$id" "$(printf '%s\n' "$budget" | jq -r '.decision_reason')"
 }
 
@@ -977,6 +1064,36 @@ cmd_bind_authority() {
   printf 'authority-bound: %s %s\n' "$id" "$authority"
 }
 
+json_field() { printf '%s\n' "$1" | jq -cr "$2"; }
+
+# A captain-authorized resume after unavailable or reset-discontinuous
+# telemetry starts a fresh versioned baseline from the current valid snapshot.
+# Burn across the discontinuity stays unmeasured; it is never estimated.
+captain_rebaseline() {
+  local budget=$1 id=$2 now=$3 ts=$4 authority=$5 digest=$6 fresh
+  fresh=$(build_baseline_budget "$id" "$(json_field "$budget" .provider)" \
+    "$(json_field "$budget" '.account_key // ""')" "$(json_field "$budget" '.model // "default"')" \
+    "$(json_field "$budget" .requested_scopes)" "$(json_field "$budget" .attribution_confidence)" \
+    "$(json_field "$budget" .concurrent_tasks)" "$(json_field "$budget" .tranche_points)" \
+    "$(json_field "$budget" .monitor_interval_seconds)" "$now")
+  [ "$(printf '%s\n' "$fresh" | jq -r '.baseline_telemetry_reasons | length')" = 0 ] \
+    || die "current telemetry cannot establish a fresh baseline; the captain answer was not spent"
+  jq -cn --argjson b "$budget" --argjson f "$fresh" --arg ts "$ts" --argjson now "$now" \
+    --arg authority "$authority" --arg digest "$digest" '
+    $b + {
+      applicable_scopes: $f.applicable_scopes,
+      windows: $f.windows,
+      baseline_telemetry_reasons: [],
+      telemetry_reasons: [],
+      telemetry_status: "known",
+      rebaselined_at: $ts,
+      rebaselined_epoch: $now,
+      rebaselines: (($b.rebaselines // []) + [{
+        at: $ts, revision: $b.revision, discarded_reasons: ($b.telemetry_reasons // []),
+        authority_task: $authority, decision_digest: $digest}])
+    }'
+}
+
 resolution_field() { printf '%s\n' "$1" | sed -n "s/^$2=//p" | head -1; }
 
 decision_budget_value() {
@@ -990,7 +1107,7 @@ decision_budget_value() {
 
 cmd_resume() {
   local id=${1:-} authority='' decision_file='' snapshot='' now_arg='' now ts pause durable digest expected decision_text
-  local points tranche budget result event resolution mode pause_reason
+  local points tranche budget result event resolution mode pause_reason rebaselined=false
   slug_valid "$id" || die "task id must be a privacy-safe slug"
   shift || true
   while [ "$#" -gt 0 ]; do
@@ -1038,21 +1155,29 @@ cmd_resume() {
      .revision += 1 |
      .pause_after_points=($points|tonumber) |
      (if $tranche != "" then .tranche_points=($tranche|tonumber) else . end) |
-     (if $pause_reason == "repeated_review_theme" then
+     (if $pause_reason == "repeated_review_theme" or $pause_reason == "review_loop_exhausted" then
        .review.captain_budget_revisions += [{at:$ts,authority_task:$authority,decision_digest:$digest}] |
        .review.creator=null | .review.critic=null | .review.corrections=[] |
        .review.deltas=[] | .review.final=null | .review.last_failure_theme=null |
-       .review.consecutive_same_theme_failures=0
+       .review.consecutive_same_theme_failures=0 | .review.post_correction_failures=0
       else . end) |
      .guard_state="active" | .decision_reason=null | .revised_at=$ts')
   BUDGET=$budget
   result=$(evaluate_budget "$budget" "$now" resume)
+  if [ "$(printf '%s\n' "$result" | jq -r '.decision.reason // ""')" = telemetry_unavailable ]; then
+    budget=$(captain_rebaseline "$budget" "$id" "$now" "$ts" "$authority" "$digest")
+    rebaselined=true
+    BUDGET=$budget
+    result=$(evaluate_budget "$budget" "$now" resume)
+  fi
   if [ "$(printf '%s\n' "$result" | jq -r '.decision.state')" != active ]; then
     die "revised budget still crosses an active reserve or telemetry boundary"
   fi
   event=$(printf '%s\n' "$result" | jq -c --arg authority "$authority" --arg digest "$digest" \
+    --argjson rebaselined "$rebaselined" \
     '.event_base | .kind="resume" | .decision.resume_authority="captain" |
-     .decision.authority_task=$authority | .decision.decision_digest=$digest')
+     .decision.authority_task=$authority | .decision.decision_digest=$digest |
+     .decision.rebaselined=$rebaselined')
   append_event "$event"
   budget=$(printf '%s\n' "$result" | jq -c '.updated_budget')
   pause=$(printf '%s\n' "$pause" | jq -c --arg ts "$ts" --arg event "$EVENT_ID" --arg digest "$digest" \
@@ -1060,6 +1185,8 @@ cmd_resume() {
      .authority_decision_digest=$digest | .resume_event_id=$event')
   atomic_json_write "$(pause_path "$id")" "$pause"
   atomic_json_write "$(budget_path "$id")" "$budget"
+  BUDGET=$budget
+  rearm_monitor "$id"
   printf 'resumed: %s revision=%s\n' "$id" "$(printf '%s\n' "$budget" | jq -r '.revision')"
 }
 
@@ -1124,6 +1251,7 @@ cmd_review() {
   if [ "$state" = paused ] || [ "$state" = pause_pending ]; then
     case "$phase:$(printf '%s\n' "$BUDGET" | jq -r '.decision_reason // ""')" in
       redesign:repeated_review_theme|rescope:repeated_review_theme) ;;
+      redesign:review_loop_exhausted|rescope:review_loop_exhausted) ;;
       *) die "task $id is resource-paused; review work cannot advance" ;;
     esac
   fi
@@ -1183,9 +1311,15 @@ cmd_review() {
         review=$(printf '%s\n' "$review" | jq -c --arg theme "$theme" \
           '.last_failure_theme=$theme | .consecutive_same_theme_failures=1')
       fi
+      if [ "$(printf '%s\n' "$review" | jq -r '.corrections | length')" -gt 0 ]; then
+        review=$(printf '%s\n' "$review" | jq -c '.post_correction_failures = ((.post_correction_failures // 0) + 1)')
+      fi
       if [ "$(printf '%s\n' "$review" | jq -r '.consecutive_same_theme_failures')" -ge 2 ]; then
         state=pause_pending
         reason=repeated_review_theme
+      elif [ "$(printf '%s\n' "$review" | jq -r '.post_correction_failures // 0')" -ge 1 ]; then
+        state=pause_pending
+        reason=review_loop_exhausted
       fi
       ;;
     correction)
@@ -1210,6 +1344,17 @@ cmd_review() {
     delta)
       [ "$(printf '%s\n' "$review" | jq -r '.corrections | length')" -eq 1 ] \
         || die "delta review requires the one accepted correction pass"
+      [ "$head" = "$(printf '%s\n' "$review" | jq -r '.corrections[0].head')" ] \
+        || die "the focused delta review must cover the accepted correction head"
+      if [ "$(printf '%s\n' "$review" | jq -r '.deltas | length')" -gt 0 ]; then
+        printf '%s\n' "$review" | jq -e --arg head "$head" --arg actor "$actor" \
+          --arg provider "$provider" --arg family "$family" '
+          .deltas[0].head == $head and .deltas[0].actor == $actor and
+          .deltas[0].provider == $provider and .deltas[0].model_family == $family' >/dev/null \
+          || die "the one focused delta review is already spent; continue to the final full review"
+        printf 'review-recorded: %s delta (idempotent)\n' "$id"
+        return 0
+      fi
       [ "$actor" != "$(printf '%s\n' "$review" | jq -r '.creator.actor')" ] \
         || die "delta reviewer must be independent from the creator"
       creator_provider=$(printf '%s\n' "$review" | jq -r '.creator.provider')
@@ -1245,8 +1390,10 @@ cmd_review() {
           same_family_reason:(if $same=="" then null else $same end),at:$ts,scope:"full"}')
       ;;
     redesign|rescope)
-      [ "$(printf '%s\n' "$BUDGET" | jq -r '.decision_reason // ""')" = repeated_review_theme ] \
-        || die "$phase is only the circuit-breaker resolution after repeated same-theme failures"
+      case "$(printf '%s\n' "$BUDGET" | jq -r '.decision_reason // ""')" in
+        repeated_review_theme|review_loop_exhausted) ;;
+        *) die "$phase is only the circuit-breaker resolution after a stopped review loop" ;;
+      esac
       [ "$(printf '%s\n' "$review" | jq -r '.last_failure_theme // ""')" = "$theme" ] \
         || die "$phase theme does not match the stopped review loop"
       review=$(printf '%s\n' "$review" | jq -c --arg kind "$phase" --arg head "$head" --arg actor "$actor" --arg theme "$theme" --arg ts "$ts" \
@@ -1254,7 +1401,7 @@ cmd_review() {
         .redesigns += [{kind:$kind,head:$head,actor:$actor,provider:$provider,model_family:$family,theme:$theme,at:$ts}] |
         .creator={head:$head,actor:$actor,provider:$provider,model_family:$family,at:$ts} | .critic=null |
         .corrections=[] | .deltas=[] | .final=null |
-        .last_failure_theme=null | .consecutive_same_theme_failures=0')
+        .last_failure_theme=null | .consecutive_same_theme_failures=0 | .post_correction_failures=0')
       state=active
       reason=''
       ;;
@@ -1266,16 +1413,21 @@ cmd_review() {
     "$provider" "$family" "$same_reason"
   if [ "$state" = pause_pending ]; then
     local evaluation pause
-    evaluation=$(printf '%s\n' "$budget" | jq -c --arg schema "$EVALUATION_SCHEMA" --arg ts "$ts" --arg theme "$theme" '
-      {schema:$schema,task_id:.task_id,trigger_ts:$ts,trigger:"repeated_review_theme",
+    evaluation=$(printf '%s\n' "$budget" | jq -c --arg schema "$EVALUATION_SCHEMA" --arg ts "$ts" --arg theme "$theme" \
+      --arg reason "$reason" '
+      {schema:$schema,task_id:.task_id,trigger_ts:$ts,trigger:$reason,
        budget_id:.budget_id,budget_revision:.revision,windows:[],
-       measured_delta:{unit:"review_failures",value:.review.consecutive_same_theme_failures,confidence:"exact"},
+       measured_delta:{unit:"review_failures",
+         value:(if $reason == "repeated_review_theme" then .review.consecutive_same_theme_failures
+                else .review.post_correction_failures end),confidence:"exact"},
        concurrent_tasks:.concurrent_tasks,pause_action:"safe_boundary_pending",
-       review:{theme:$theme,consecutive_failures:.review.consecutive_same_theme_failures},
+       review:{theme:$theme,consecutive_failures:.review.consecutive_same_theme_failures,
+         post_correction_failures:.review.post_correction_failures},
        resume:{required:"redesign_rescope_or_captain",authority_task:null,decision_digest:null}}')
     publish_evaluation "$id" "$evaluation"
-    pause=$(printf '%s\n' "$budget" | jq -c --arg schema "$PAUSE_SCHEMA" --arg ts "$ts" --arg event "$EVENT_ID" --arg eval "$EVALUATION_ID" '
-      {schema:$schema,task_id:.task_id,requested_at:$ts,reason:"repeated_review_theme",state:"pause_pending",
+    pause=$(printf '%s\n' "$budget" | jq -c --arg schema "$PAUSE_SCHEMA" --arg ts "$ts" --arg event "$EVENT_ID" --arg eval "$EVALUATION_ID" \
+      --arg reason "$reason" '
+      {schema:$schema,task_id:.task_id,requested_at:$ts,reason:$reason,state:"pause_pending",
        safe_boundary:null,budget_id:.budget_id,budget_revision:.revision,trigger_event_id:$event,evaluation_id:$eval,
        authority_task:null,authority_lifecycle:null,authority_decision_digest:null,resume_authority:null}')
     atomic_json_write "$(pause_path "$id")" "$pause"
@@ -1286,12 +1438,16 @@ cmd_review() {
     atomic_json_write "$(pause_path "$id")" "$pause"
   fi
   atomic_json_write "$(budget_path "$id")" "$budget"
+  if [ "$phase" = redesign ] || [ "$phase" = rescope ]; then
+    BUDGET=$budget
+    rearm_monitor "$id"
+  fi
   printf 'review-recorded: %s %s state=%s\n' "$id" "$phase" "$state"
   [ "$state" = active ] || return 3
 }
 
 cmd_monitor() {
-  local id=${1:-} interval='' out rc
+  local id=${1:-} interval='' out rc failures=0
   slug_valid "$id" || die "task id must be a privacy-safe slug"
   shift || true
   while [ "$#" -gt 0 ]; do
@@ -1303,10 +1459,30 @@ cmd_monitor() {
   while :; do
     sleep "$interval"
     rc=0
-    out=$("$0" check "$id" 2>&1) || rc=$?
+    out=$("$0" check "$id" --monitor 2>/dev/null) || rc=$?
     case "$rc" in
-      0) continue ;;
+      0)
+        failures=0
+        if [ "$(printf '%s\n' "$out" | jq -r '.auto_resumed' 2>/dev/null)" = true ]; then
+          printf 'resource: %s\n' "$id"
+          printf 'status: resumed\n'
+          printf 'decision: %s\n' "$out"
+          printf 'action: the proven near-reset floor reopened the budget; tell the worker it may resume\n'
+          return 0
+        fi
+        ;;
       3)
+        failures=0
+        case "$(printf '%s\n' "$out" | jq -r '"\(.state):\(.reason)"' 2>/dev/null)" in
+          paused:reserve_floor) continue ;;
+          paused:*)
+            printf 'resource: %s\n' "$id"
+            printf 'status: awaiting-authority\n'
+            printf 'decision: %s\n' "$out"
+            printf 'action: the lane stays paused until a captain decision, redesign, or re-scope\n'
+            return 0
+            ;;
+        esac
         printf 'resource: %s\n' "$id"
         printf 'status: pause-required\n'
         printf 'decision: %s\n' "$out"
@@ -1314,6 +1490,8 @@ cmd_monitor() {
         return 0
         ;;
       *)
+        failures=$((failures + 1))
+        [ "$failures" -ge 3 ] || continue
         printf 'resource: %s\n' "$id"
         printf 'status: error\n'
         printf 'detail: resource guard check failed without exposing quota payloads\n'
@@ -1369,6 +1547,11 @@ cmd_worker_overlay() {
   slug_valid "$id" || die "task id must be a privacy-safe slug"
   [ "$#" -eq 1 ] || usage
   load_budget "$id"
+  if [ "$(printf '%s\n' "$BUDGET" | jq -r '.guard_state')" != active ]; then
+    printf 'error: task %s resource budget is %s; do not dispatch until the guard authorizes it\n' \
+      "$id" "$(printf '%s\n' "$BUDGET" | jq -r '.guard_state')" >&2
+    exit 3
+  fi
   cat <<'EOF'
 
 # Resource budget boundary
@@ -1378,9 +1561,9 @@ If a resource-pause instruction arrives, preserve every file and branch and stop
 Never force, stash, reset, discard, or interrupt a branch-owning validation run to satisfy that request; let its current action reach a supported gate or return custody first.
 At that boundary append the required `paused [at=<epoch>]: resource guard safe boundary reached` event and stop work.
 Do not resume from elapsed time, recovered quota, or your own judgment; resume only after firstmate says the durable guard has authorized it.
-Use one creator pass, one independent critic pass, one accepted correction pass, focused delta review between the first and final heads, and a complete independent review of the final head.
+Use one creator pass, one independent critic pass, one accepted correction pass, one focused delta review of the corrected head, and a complete independent review of the final head.
 Use a different provider or model family for independent review whenever feasible, and record the concrete exception when it is not.
-A second consecutive failure of the same theme stops the loop for redesign, re-scope, or a captain-authorized revised budget.
+Any failure after the accepted correction, or a second consecutive failure of the same theme, stops the loop for redesign, re-scope, or a captain-authorized revised budget.
 EOF
 }
 

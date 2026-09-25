@@ -44,6 +44,8 @@ The evaluator applies these rules:
 A window's burn is measured against its task-start baseline only while its reset identity is continuous.
 A provider replenishment cannot produce a negative burn.
 When a reset changes between checks, the guard records an unavailable measurement and asks for review because work between the reset and the first observed post-reset sample cannot be attributed exactly.
+The baseline reset identity is kept, so later checks stay discontinuous rather than silently healing.
+Only an exact captain answer can resume such a pause, and it does so by starting a fresh versioned baseline from current valid telemetry; it refuses when the current snapshot cannot establish one.
 
 Near-reset relaxation is intentionally narrower than ordinary recovery.
 Only the proven 15/5 floor rule can reopen an ordinary reserve pause automatically.
@@ -56,12 +58,15 @@ A revised budget changes the task burn allowance and optional tranche; it cannot
 A monitor never interrupts or exits a worker.
 It also never stashes, resets, checks out another branch, cleans files, aborts a validation run, or starts a competing run.
 It records `pause_pending` and wakes Firstmate.
+A failed or malformed quota read during monitoring is recorded the same way, as `telemetry_unavailable` with reason `telemetry_read_failed` over the last known baseline, so the monitor never retires while the budget stays active.
+Every authorized return to active re-arms the task's single monitor registration, and a finalized reserve pause keeps it armed so the near-reset proof can reopen the lane and report `resumed`.
 
 Firstmate asks the worker to stop at its next safe boundary.
 For ordinary work, that means the current atomic write/test action is complete and all branches/files remain preserved.
 For branch-owning validation, that means the current supported action has reached a gate or the validation owner has returned branch custody through its own protocol.
 The worker appends its normal `paused` task event only after reaching that point.
-The guard's `pause` command verifies that latest worker event before finalizing `paused`.
+The guard's `pause` command verifies that latest worker event, and that its `[at=<epoch>]` stamp is no older than the pause request, before finalizing `paused`.
+`fm-spawn` refuses to launch a task whose budget is not active.
 
 This cooperative boundary is portable across worker runtimes and does not weaken the existing validation custody rules.
 
@@ -74,7 +79,7 @@ It enforces:
 1. one creator pass;
 2. one full independent critic pass on the frozen creator head;
 3. one accepted correction pass owned by the creator;
-4. focused independent delta review of intermediate corrected heads;
+4. one focused independent delta review of the corrected head;
 5. a complete independent review of the exact final head.
 
 Critic, delta, and final sessions must differ from the creator session.
@@ -83,7 +88,8 @@ Using the same provider and family requires an explicit privacy-safe reason slug
 
 A first review failure opens the one correction opportunity.
 A second consecutive failure under the same theme opens `pause_pending` with reason `repeated_review_theme`.
-Another same-theme loop is refused until a materially new redesign/re-scope is recorded or the captain authorizes a revised budget.
+Any other failure after the accepted correction opens `pause_pending` with reason `review_loop_exhausted`, so alternating themes cannot loop.
+Further review is refused until a materially new redesign/re-scope is recorded or the captain authorizes a revised budget.
 This bounds review spend without treating a focused delta review as a substitute for the required final full review.
 
 ## Local records and trust boundaries

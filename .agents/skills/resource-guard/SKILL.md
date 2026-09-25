@@ -53,7 +53,7 @@ Do not turn uncertainty into zero spend or an exact estimate.
 
 Run `start` after the task record and instructions exist but before `fm-spawn`.
 A healthy start registers the monitor, and `fm-spawn` injects the harness-independent safe-boundary overlay when the budget record exists.
-A pause result at start means do not dispatch.
+A pause result at start means do not dispatch; `fm-spawn` also refuses any budget that is not active.
 An unavailable or ambiguous provider/account/scope result is a real blocker to unguarded dispatch; correct the selection or escalate the uncertainty rather than inventing a value.
 
 ## Handle a resource notification
@@ -69,9 +69,12 @@ For `pause-required`:
 3. Do not interrupt, exit, stash, reset, switch branches, abort validation, or start a competing validation run merely to make the pause immediate.
 4. During validation, let the current supported action reach a gate or let branch custody return under the validation owner's own protocol.
 5. Reconcile current worker state until its newest task status says it is paused at the resource boundary.
-6. Run `fm-resource-guard.sh pause <task-id>`; it refuses unless that worker evidence exists.
+6. Run `fm-resource-guard.sh pause <task-id>`; it refuses unless that worker evidence exists and is stamped no earlier than the pause request.
 7. Acknowledge the process-event result only after the safe pause is durable.
 
+For `resumed`, the proven near-reset floor reopened the budget; tell the worker it may resume.
+For `awaiting-authority`, the lane stays paused until a captain decision, redesign, or re-scope.
+A monitor-time unavailable or malformed quota read arrives as `pause-required` with reason `telemetry_unavailable`; handle it like any other pause.
 For `error`, preserve the task and report the concrete telemetry or local-record failure.
 Never continue on a cached, guessed, or manually entered percentage.
 A malformed or reset-discontinuous window is unavailable evidence, not zero and not full capacity.
@@ -91,6 +94,7 @@ For a captain-approved revised budget:
 6. Resume the worker only after the guard reports active.
 
 The revised number changes the task burn allowance, never reserve floors.
+When the pause is unavailable or reset-discontinuous telemetry, the same answer starts a fresh versioned baseline from the current snapshot; resume refuses if that snapshot is still unavailable.
 The guard matches the answer digest and exact hold lifecycle without copying captain text into resource events.
 A released, re-held, later, mismatched, or synthetic answer is not authority.
 
@@ -108,7 +112,7 @@ The allowed sequence is:
 1. one creator pass on a frozen head;
 2. one full critic pass from a different session;
 3. at most one accepted correction pass owned by the creator;
-4. focused delta review on intermediate corrected heads;
+4. one focused delta review of the corrected head;
 5. one complete independent review of the exact final head.
 
 Use a different provider or model family for critic, delta, and final review whenever it is available and appropriate.
@@ -116,7 +120,7 @@ When the same provider and family are genuinely necessary, record a concrete pri
 
 Record a failure only from the critic or latest delta reviewer that actually reviewed that exact head.
 Use a stable privacy-safe theme slug for materially the same finding.
-The second consecutive failure of that theme stops the lane.
+The second consecutive failure of that theme stops the lane, and so does any failure after the accepted correction.
 Do not buy a third same-theme attempt with more review cycles; redesign, re-scope, or seek a captain-approved revised budget.
 A changed theme does not erase an already spent correction pass.
 

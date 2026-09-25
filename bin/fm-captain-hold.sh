@@ -1858,12 +1858,6 @@ EOF
   done
 }
 
-# Still an open captain call? Exit 0 yes, 1 no, 2 cannot tell (see the header).
-# A row this home does not carry is 3 when the caller requests the distinction,
-# and so is a home with no backlog file at all, because a backlog that does not
-# exist holds nothing. Every read failure over a record that DOES exist is a 2,
-# printed to stderr, because a mechanical closer must never read "cannot tell"
-# as permission to close.
 command_resolution() {  # <task-id> --lifecycle <open-identity>
   local id=${1:-} expected='' show state hold_kind body mode digest before_count current_count stamp
   [ "$#" -ge 1 ] || { usage >&2; exit 2; }
@@ -1910,6 +1904,12 @@ command_resolution() {  # <task-id> --lifecycle <open-identity>
     "$id" "$mode" "$digest" "$current_count"
 }
 
+# Still an open captain call? Exit 0 yes, 1 no, 2 cannot tell (see the header).
+# A row this home does not carry is 3 when the caller requests the distinction,
+# and so is a home with no backlog file at all, because a backlog that does not
+# exist holds nothing. Every read failure over a record that DOES exist is a 2,
+# printed to stderr, because a mechanical closer must never read "cannot tell"
+# as permission to close.
 command_open() {  # <task-id> [--identity] [--distinguish-absent]
   local id='' identity=0 distinguish_absent=0 data state root file backend show shown_body
   while [ "$#" -gt 0 ]; do

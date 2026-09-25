@@ -1431,7 +1431,25 @@ SH
   expect_code 1 "$?" "corrupt resource budget unexpectedly launched a worker: $out"
   assert_contains "$out" "unsafe or corrupt resource budget" \
     "corrupt resource budget refusal did not name the guard"
-  pass "fm-spawn: guarded tasks carry the shared boundary and corrupt budgets refuse launch"
+
+  for state in pause_pending paused; do
+    id=resource-overlay-$state
+    id=${id//_/-}
+    rec=$(make_spawn_case "$id" codex)
+    read_case_record "$rec"
+    fm_test_spawn_brief "$HOME_DIR" "$id"
+    jq -n --arg task "$id" --arg state "$state" '{
+      schema:"fm.task-resource-budget.v1",task_id:$task,provider:"codex",
+      guard_state:$state,decision_reason:"reserve_floor",windows:[],review:{},revision:1
+    }' >"$HOME_DIR/state/$id.resource-budget.json"
+    : >"$LAUNCH_LOG"
+    out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --mode no-mistakes --yolo off)
+    expect_code 1 "$?" "$state resource budget unexpectedly launched a worker: $out"
+    assert_contains "$out" "paused or pending a pause" \
+      "$state resource budget refusal did not name the pause"
+    [ ! -s "$LAUNCH_LOG" ] || fail "$state resource budget still reached the launch command"
+  done
+  pass "fm-spawn: guarded tasks carry the shared boundary and corrupt or non-active budgets refuse launch"
 }
 
 # config/claude-permission-mode (bin/fm-spawn.sh header): absent and `bypass`
