@@ -580,6 +580,12 @@ expect_rc 1 run_guard "$home" review sample final --head bbbbbbb --actor final-1
 run_guard "$home" review sample correction --head bbbbbbb --actor creator-1 --provider codex --family gpt5 --theme theme-a --now 1800000060 >/dev/null
 expect_rc 1 run_guard "$home" review sample final --head bbbbbbb --actor final-1 --provider claude --family sonnet --now 1800000070
 run_guard "$home" review sample delta --head bbbbbbb --actor critic-1 --provider claude --family sonnet --theme theme-a --now 1800000080 >/dev/null
+run_guard "$home" review sample failure --head aaaaaaa --actor critic-1 --provider claude --family sonnet --theme theme-a --now 1800000081 >/dev/null \
+  || fail "critic failure replay was not idempotent after delta progression"
+jq -e '.guard_state == "active" and .review.consecutive_same_theme_failures == 1 and
+  .review.post_correction_failures == 0 and (.review.failures | length) == 1 and
+  .review.failures[0].stage == "critic"' "$home/state/sample.resource-budget.json" >/dev/null \
+  || fail "critic failure replay after delta progression consumed the failure budget"
 run_guard "$home" review sample final --head bbbbbbb --actor final-1 --provider claude --family sonnet --now 1800000090 >/dev/null \
   || fail "completed correction and delta sequence did not permit final review"
 jq -e '.review.final.head == "bbbbbbb" and (.review.deltas | length) == 1' \

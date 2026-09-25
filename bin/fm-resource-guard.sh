@@ -1341,18 +1341,18 @@ cmd_review() {
   [ "$(printf '%s\n' "$review" | jq -r '.final // empty')" = "" ] \
     || die "final review is already durable; the review ledger is closed"
   if [ "$phase" = failure ]; then
+    if printf '%s\n' "$review" | jq -e --arg head "$head" \
+      --arg actor "$actor" --arg provider "$provider" --arg family "$family" --arg theme "$theme" '
+      any((.failures // [])[];
+        .head == $head and .actor == $actor and
+        .provider == $provider and .model_family == $family and .theme == $theme)' >/dev/null; then
+      printf 'review-recorded: %s failure (idempotent)\n' "$id"
+      return 0
+    fi
     if [ "$(printf '%s\n' "$review" | jq -r '.deltas | length')" -gt 0 ]; then
       failure_stage=delta
     else
       failure_stage=critic
-    fi
-    if printf '%s\n' "$review" | jq -e --arg stage "$failure_stage" --arg head "$head" \
-      --arg actor "$actor" --arg provider "$provider" --arg family "$family" --arg theme "$theme" '
-      any((.failures // [])[];
-        .stage == $stage and .head == $head and .actor == $actor and
-        .provider == $provider and .model_family == $family and .theme == $theme)' >/dev/null; then
-      printf 'review-recorded: %s failure (idempotent)\n' "$id"
-      return 0
     fi
   fi
   if [ "$state" = paused ] || [ "$state" = pause_pending ]; then
