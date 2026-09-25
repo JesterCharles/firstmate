@@ -811,15 +811,21 @@ apply_evaluation() {
     || [ "$(printf '%s\n' "$result" | jq -r '.decision.auto_resumed')" = true ]; then
     append_event "$event"
   fi
-  if [ "$state" = pause_pending ] && { [ "$previous_state" != pause_pending ] || [ "$previous_reason" != "$reason" ]; }; then
+  if [ "$state" = pause_pending ] && [ "$previous_state" != pause_pending ] && [ "$previous_state" != paused ]; then
     evaluation=$(printf '%s\n' "$result" | jq -c '.evaluation_base')
     publish_evaluation "$id" "$evaluation"
     pause=$(printf '%s\n' "$result" | jq -c --arg event "$EVENT_ID" --arg eval "$EVALUATION_ID" \
       '.pause_base + {trigger_event_id: $event, evaluation_id: $eval}')
     atomic_json_write "$(pause_path "$id")" "$pause"
   elif [ "$(printf '%s\n' "$result" | jq -r '.decision.escalated')" = true ] && [ -f "$(pause_path "$id")" ]; then
+    # An escalation keeps the original request identity, time, origin, and
+    # boundary evidence; only the current reason and its evidence change.
+    evaluation=$(printf '%s\n' "$result" | jq -c '.evaluation_base')
+    publish_evaluation "$id" "$evaluation"
     pause=$(jq -ce --arg ts "$(printf '%s\n' "$result" | jq -r '.event_base.ts')" --arg reason "$reason" \
-      --arg event "$EVENT_ID" '.reason=$reason | .escalated_at=$ts | .escalation_event_id=$event' \
+      --arg event "$EVENT_ID" --arg eval "$EVALUATION_ID" '
+      .reason_history = (((.reason_history // []) + [{reason: .reason, until: $ts}]) | .[-8:]) |
+      .reason=$reason | .escalated_at=$ts | .escalation_event_id=$event | .escalation_evaluation_id=$eval' \
       "$(pause_path "$id")") || die "cannot record resource pause escalation"
     atomic_json_write "$(pause_path "$id")" "$pause"
   elif [ "$(printf '%s\n' "$result" | jq -r '.decision.auto_resumed')" = true ]; then

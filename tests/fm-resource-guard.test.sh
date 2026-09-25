@@ -478,6 +478,38 @@ printf 'working [at=1800000005]: already launched\n' >"$home/state/sample.status
 expect_rc 1 run_guard "$home" pause sample --pre-dispatch --now 1800000010
 ok "a pause raised at start finalizes before dispatch without inventing worker status"
 
+home=$(make_home pre-dispatch-escalation)
+write_snapshot "$home/far.json" 44 2027-01-15T15:00:00Z
+write_snapshot "$home/reset.json" 44 2031-01-01T00:00:00Z
+expect_rc 3 start_guard "$home" "$home/far.json"
+requested=$(jq -r .requested_at "$home/state/sample.resource-pause.json")
+expect_rc 3 run_guard "$home" check sample --snapshot "$home/reset.json" --now 1800000100
+jq -e --arg requested "$requested" '.reason == "telemetry_unavailable" and .raised_by == "task_baseline" and
+  .requested_at == $requested and .reason_history[0].reason == "reserve_floor"' \
+  "$home/state/sample.resource-pause.json" >/dev/null \
+  || fail "pending-pause escalation rewrote the original request identity"
+run_guard "$home" pause sample --pre-dispatch --now 1800000101 >/dev/null \
+  || fail "an escalated pre-dispatch pause could no longer finalize"
+[ "$(jq -r .decision_reason "$home/state/sample.resource-budget.json")" = telemetry_unavailable ] \
+  || fail "pre-dispatch finalization lost the escalated reason"
+
+home=$(make_home worker-escalation)
+write_snapshot "$home/base.json" 40 2027-01-15T13:00:00Z
+write_snapshot "$home/low.json" 40 2027-01-15T13:00:00Z '' projected_exhaustion
+write_snapshot "$home/reset.json" 40 2031-01-01T00:00:00Z
+start_guard "$home" "$home/base.json" >/dev/null
+printf 'working [at=1800000050]: guarded work\n' >"$home/state/sample.status"
+expect_rc 3 run_guard "$home" check sample --snapshot "$home/low.json" --now 1800000100
+[ "$(jq -r .decision_reason "$home/state/sample.resource-budget.json")" = reserve_floor ] \
+  || fail "worker-escalation fixture did not start from a reserve pause"
+printf 'paused [at=1800000110]: resource guard safe boundary reached\n' >>"$home/state/sample.status"
+expect_rc 3 run_guard "$home" check sample --snapshot "$home/reset.json" --now 1800000200
+run_guard "$home" pause sample --now 1800000201 >/dev/null \
+  || fail "escalation invalidated the worker's already delivered safe boundary"
+jq -e '.state == "paused" and .reason == "telemetry_unavailable" and .safe_boundary == "worker_reported"' \
+  "$home/state/sample.resource-pause.json" >/dev/null || fail "escalated worker pause was not finalized"
+ok "pending-pause escalation keeps the original request so delivered and pre-dispatch boundaries still finalize"
+
 home=$(make_home review)
 write_snapshot "$home/base.json" 80 2030-01-01T00:00:00Z
 start_guard "$home" "$home/base.json" >/dev/null
