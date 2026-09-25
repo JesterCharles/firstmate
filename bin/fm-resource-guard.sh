@@ -468,6 +468,7 @@ build_baseline_budget() {
         critic: null,
         corrections: [],
         deltas: [],
+        failures: [],
         final: null,
         last_failure_theme: null,
         consecutive_same_theme_failures: 0,
@@ -1246,7 +1247,7 @@ cmd_resume() {
      (if $pause_reason == "repeated_review_theme" or $pause_reason == "review_loop_exhausted" then
        .review.captain_budget_revisions += [{at:$ts,authority_task:$authority,decision_digest:$digest}] |
        .review.creator=null | .review.critic=null | .review.corrections=[] |
-       .review.deltas=[] | .review.final=null | .review.last_failure_theme=null |
+       .review.deltas=[] | .review.failures=[] | .review.final=null | .review.last_failure_theme=null |
        .review.consecutive_same_theme_failures=0 | .review.post_correction_failures=0
       else . end) |
      .guard_state="active" | .decision_reason=null | .revised_at=$ts')
@@ -1303,6 +1304,7 @@ review_event() {
 cmd_review() {
   local id=${1:-} phase=${2:-} head='' actor='' theme='' provider='' family='' same_reason=''
   local now_arg='' now ts budget review state reason='' creator creator_head creator_actor creator_provider creator_family
+  local failure_stage
   slug_valid "$id" || die "task id must be a privacy-safe slug"
   shift 2 2>/dev/null || true
   while [ "$#" -gt 0 ]; do
@@ -1336,6 +1338,23 @@ cmd_review() {
   load_budget "$id"
   review=$(printf '%s\n' "$BUDGET" | jq -c '.review')
   state=$(printf '%s\n' "$BUDGET" | jq -r '.guard_state')
+  [ "$(printf '%s\n' "$review" | jq -r '.final // empty')" = "" ] \
+    || die "final review is already durable; the review ledger is closed"
+  if [ "$phase" = failure ]; then
+    if [ "$(printf '%s\n' "$review" | jq -r '.deltas | length')" -gt 0 ]; then
+      failure_stage=delta
+    else
+      failure_stage=critic
+    fi
+    if printf '%s\n' "$review" | jq -e --arg stage "$failure_stage" --arg head "$head" \
+      --arg actor "$actor" --arg provider "$provider" --arg family "$family" --arg theme "$theme" '
+      any((.failures // [])[];
+        .stage == $stage and .head == $head and .actor == $actor and
+        .provider == $provider and .model_family == $family and .theme == $theme)' >/dev/null; then
+      printf 'review-recorded: %s failure (idempotent)\n' "$id"
+      return 0
+    fi
+  fi
   if [ "$state" = paused ] || [ "$state" = pause_pending ]; then
     case "$phase:$(printf '%s\n' "$BUDGET" | jq -r '.decision_reason // ""')" in
       redesign:repeated_review_theme|rescope:repeated_review_theme) ;;
@@ -1393,6 +1412,10 @@ cmd_review() {
           .critic.provider == $provider and .critic.model_family == $family' >/dev/null \
           || die "review failure does not match the independent critic pass"
       fi
+      review=$(printf '%s\n' "$review" | jq -c --arg stage "$failure_stage" --arg head "$head" \
+        --arg actor "$actor" --arg provider "$provider" --arg family "$family" --arg theme "$theme" --arg ts "$ts" '
+        .failures = ((.failures // []) + [{stage:$stage,head:$head,actor:$actor,provider:$provider,
+          model_family:$family,theme:$theme,at:$ts}])')
       if [ "$(printf '%s\n' "$review" | jq -r '.last_failure_theme // ""')" = "$theme" ]; then
         review=$(printf '%s\n' "$review" | jq -c '.consecutive_same_theme_failures += 1')
       else
@@ -1505,7 +1528,7 @@ cmd_review() {
         --arg provider "$provider" --arg family "$family" '
         .redesigns += [{kind:$kind,head:$head,actor:$actor,provider:$provider,model_family:$family,theme:$theme,at:$ts}] |
         .creator={head:$head,actor:$actor,provider:$provider,model_family:$family,at:$ts} | .critic=null |
-        .corrections=[] | .deltas=[] | .final=null |
+        .corrections=[] | .deltas=[] | .failures=[] | .final=null |
         .last_failure_theme=null | .consecutive_same_theme_failures=0 | .post_correction_failures=0')
       state=active
       reason=''

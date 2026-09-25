@@ -570,6 +570,12 @@ run_guard "$home" review sample creator --head aaaaaaa --actor creator-1 --provi
 expect_rc 1 run_guard "$home" review sample final --head bbbbbbb --actor final-1 --provider claude --family sonnet --now 1800000020
 run_guard "$home" review sample critic --head aaaaaaa --actor critic-1 --provider claude --family sonnet --now 1800000030 >/dev/null
 run_guard "$home" review sample failure --head aaaaaaa --actor critic-1 --provider claude --family sonnet --theme theme-a --now 1800000040 >/dev/null
+run_guard "$home" review sample failure --head aaaaaaa --actor critic-1 --provider claude --family sonnet --theme theme-a --now 1800000041 >/dev/null \
+  || fail "exact critic failure replay was not idempotent"
+jq -e '.guard_state == "active" and .review.consecutive_same_theme_failures == 1 and
+  (.review.failures | length) == 1 and .review.failures[0].stage == "critic"' \
+  "$home/state/sample.resource-budget.json" >/dev/null \
+  || fail "exact critic failure replay consumed another bounded attempt"
 expect_rc 1 run_guard "$home" review sample final --head bbbbbbb --actor final-1 --provider claude --family sonnet --now 1800000050
 run_guard "$home" review sample correction --head bbbbbbb --actor creator-1 --provider codex --family gpt5 --theme theme-a --now 1800000060 >/dev/null
 expect_rc 1 run_guard "$home" review sample final --head bbbbbbb --actor final-1 --provider claude --family sonnet --now 1800000070
@@ -579,6 +585,17 @@ run_guard "$home" review sample final --head bbbbbbb --actor final-1 --provider 
 jq -e '.review.final.head == "bbbbbbb" and (.review.deltas | length) == 1' \
   "$home/state/sample.resource-budget.json" >/dev/null \
   || fail "final review did not preserve the completed predecessor sequence"
+cp "$home/state/sample.resource-budget.json" "$home/final-budget.json"
+expect_rc 1 run_guard "$home" review sample creator --head bbbbbbb --actor creator-1 --provider codex --family gpt5 --now 1800000100
+expect_rc 1 run_guard "$home" review sample critic --head bbbbbbb --actor critic-2 --provider claude --family sonnet --now 1800000101
+expect_rc 1 run_guard "$home" review sample failure --head bbbbbbb --actor critic-1 --provider claude --family sonnet --theme theme-a --now 1800000102
+expect_rc 1 run_guard "$home" review sample correction --head ccccccc --actor creator-1 --provider codex --family gpt5 --theme theme-a --now 1800000103
+expect_rc 1 run_guard "$home" review sample delta --head bbbbbbb --actor critic-1 --provider claude --family sonnet --now 1800000104
+expect_rc 1 run_guard "$home" review sample final --head bbbbbbb --actor final-2 --provider claude --family sonnet --now 1800000105
+expect_rc 1 run_guard "$home" review sample redesign --head ccccccc --actor creator-2 --provider codex --family gpt5 --theme theme-a --now 1800000106
+expect_rc 1 run_guard "$home" review sample rescope --head ccccccc --actor creator-2 --provider codex --family gpt5 --theme theme-a --now 1800000107
+cmp -s "$home/final-budget.json" "$home/state/sample.resource-budget.json" \
+  || fail "a post-final phase mutated the closed review ledger"
 ok "final review requires critic resolution and corrected-head delta evidence"
 
 home=$(make_home review-bound)
@@ -608,8 +625,12 @@ run_guard "$home" review sample delta --head bbbbbbb --actor critic-1 $review_ar
 expect_rc 1 run_guard "$home" review sample delta --head bbbbbbb --actor critic-3 $review_args --now 1800000055
 # shellcheck disable=SC2086
 expect_rc 3 run_guard "$home" review sample failure --head bbbbbbb --actor critic-1 $review_args --theme theme-b --now 1800000060
+# shellcheck disable=SC2086
+run_guard "$home" review sample failure --head bbbbbbb --actor critic-1 $review_args --theme theme-b --now 1800000061 >/dev/null \
+  || fail "exact delta failure replay was not idempotent after the circuit breaker"
 jq -e '.guard_state == "pause_pending" and .decision_reason == "review_loop_exhausted" and
-  .review.post_correction_failures == 1 and (.review.deltas | length) == 1' \
+  .review.post_correction_failures == 1 and (.review.deltas | length) == 1 and
+  ([.review.failures[] | select(.stage == "delta")] | length) == 1' \
   "$home/state/sample.resource-budget.json" >/dev/null \
   || fail "an alternating-theme failure after the correction did not stop the loop"
 printf 'paused [at=1800000061]: resource guard safe boundary reached\n' >"$home/state/sample.status"
