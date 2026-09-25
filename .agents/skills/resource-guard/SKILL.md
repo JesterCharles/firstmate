@@ -54,6 +54,7 @@ Do not turn uncertainty into zero spend or an exact estimate.
 Run `start` after the task record and instructions exist but before `fm-spawn`.
 A healthy start registers the monitor, and `fm-spawn` injects the harness-independent safe-boundary overlay when the budget record exists.
 A pause result at start means do not dispatch; `fm-spawn` also refuses any budget that is not active.
+Finalize that pause with `fm-resource-guard.sh pause <task-id> --pre-dispatch`, then resume only through the near-reset proof or captain authority below.
 An unavailable or ambiguous provider/account/scope result is a real blocker to unguarded dispatch; correct the selection or escalate the uncertainty rather than inventing a value.
 
 ## Handle a resource notification
@@ -75,7 +76,8 @@ For `pause-required`:
 For `resumed`, the proven near-reset floor reopened the budget; tell the worker it may resume.
 For `awaiting-authority`, the lane stays paused until a captain decision, redesign, or re-scope.
 A monitor-time unavailable or malformed quota read arrives as `pause-required` with reason `telemetry_unavailable`; handle it like any other pause.
-For `error`, preserve the task and report the concrete telemetry or local-record failure.
+For `error`, preserve the task and report the concrete telemetry or local-record failure; the monitor stays registered and retries.
+For `retired`, the budget was retired and the source has ended.
 Never continue on a cached, guessed, or manually entered percentage.
 A malformed or reset-discontinuous window is unavailable evidence, not zero and not full capacity.
 

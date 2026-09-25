@@ -9,8 +9,9 @@
 # Policy, quota reads, record mutation, privacy, and pause semantics remain
 # wholly owned by fm-resource-guard.sh. This adapter only gives the generic
 # process-event runner its stable built-in classify/terminal surface. A
-# `resumed` result is not terminal: the source stays registered so the runner
-# restarts the same one monitor for the reopened budget.
+# `resumed` or `error` result is not terminal: the source stays registered so
+# the runner restarts the same one monitor for the reopened or still-guarded
+# budget.
 set -u
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
@@ -46,13 +47,14 @@ case "${1-}" in
       pause-required) printf 'pause-required\n' ;;
       awaiting-authority) printf 'awaiting-authority\n' ;;
       resumed) printf 'resumed\n' ;;
+      retired) printf 'retired\n' ;;
       error) printf 'error\n' ;;
       *) printf 'unknown\n' ;;
     esac
     ;;
   terminal)
     [ "$#" -eq 2 ] || usage
-    case "$(result_status "$2")" in pause-required|awaiting-authority|error) exit 0 ;; *) exit 1 ;; esac
+    case "$(result_status "$2")" in pause-required|awaiting-authority|retired) exit 0 ;; *) exit 1 ;; esac
     ;;
   ''|-h|--help|help) usage ;;
   *) die "unknown command: $1" ;;

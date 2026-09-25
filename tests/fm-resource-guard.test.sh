@@ -16,7 +16,7 @@ command -v jq >/dev/null 2>&1 || { echo "skip: jq not found"; exit 0; }
 ok() { printf 'ok - %s\n' "$1"; }
 
 make_home() {
-  local name=$1 home="$TMP_ROOT/$1"
+  local home="$TMP_ROOT/$1"
   mkdir -p "$home/state" "$home/data" "$home/config"
   printf '%s\n' "$home"
 }
@@ -405,6 +405,79 @@ fi
 [ "$(monitor_count "$home")" = 1 ] || fail "near-reset resume duplicated or dropped the monitor"
 ok "a reserve pause keeps one monitor armed and its near-reset proof resumes without retiring it"
 
+home=$(make_home monitor-reset-escalation)
+now_real=$(date +%s)
+reset_epoch=$((now_real + 10800))
+write_snapshot "$home/near.json" 30 "$(iso_epoch "$reset_epoch")"
+write_snapshot "$home/after-reset.json" 30 "$(iso_epoch "$((reset_epoch + 604800))")"
+start_epoch=$((reset_epoch - 25200))
+expect_rc 3 run_guard "$home" start sample --provider codex --snapshot "$home/near.json" \
+  --attribution exact --interval 1 --now "$start_epoch"
+run_guard "$home" pause sample --pre-dispatch --now "$((start_epoch + 1))" >/dev/null \
+  || fail "reserve pause raised at start did not finalize before dispatch"
+[ "$(monitor_count "$home")" = 1 ] || fail "pre-dispatch reserve pause did not keep a monitor armed"
+make_fake_quota "$home/fakebin"
+out=$(PATH="$home/fakebin:$PATH" FAKE_QUOTA_SNAPSHOT="$home/after-reset.json" run_guard "$home" monitor sample --interval 1) \
+  || fail "reserve-paused monitor failed across a reset"
+printf '%s\n' "$out" | grep -qx 'status: awaiting-authority' \
+  || fail "reset discontinuity left the reserve-paused monitor looping silently: $out"
+jq -e '.guard_state == "paused" and .decision_reason == "telemetry_unavailable" and
+  (.telemetry_reasons | index("window_reset_changed"))' "$home/state/sample.resource-budget.json" >/dev/null \
+  || fail "reset discontinuity did not escalate the reserve pause to durable authority"
+jq -e '.state == "paused" and .reason == "telemetry_unavailable" and .escalated_at != null' \
+  "$home/state/sample.resource-pause.json" >/dev/null || fail "pause record did not record the escalation"
+printf '%s\n' "$out" >"$home/result"
+$ADAPTER terminal "$home/result" || fail "authority-required escalation was not a terminal wake"
+ok "a reserve-paused monitor escalates to durable authority when reset discontinuity ends near-reset proof"
+
+home=$(make_home monitor-local-error)
+write_snapshot "$home/base.json" 80 2030-01-01T00:00:00Z
+start_guard "$home" "$home/base.json" >/dev/null
+printf 'not-json\n' >"$home/state/sample.resource-budget.json"
+out=$(run_guard "$home" monitor sample --interval 1) || fail "monitor crashed on a local record error"
+printf '%s\n' "$out" | grep -qx 'status: error' || fail "persistent local errors were not surfaced: $out"
+printf '%s\n' "$out" >"$home/result"
+if $ADAPTER terminal "$home/result"; then
+  fail "a local monitor error retired the guarded source"
+fi
+home=$(make_home monitor-retired)
+write_snapshot "$home/base.json" 80 2030-01-01T00:00:00Z
+start_guard "$home" "$home/base.json" >/dev/null
+run_guard "$home" retire sample >/dev/null
+out=$(run_guard "$home" monitor sample --interval 1) || fail "monitor failed on a retired budget"
+printf '%s\n' "$out" | grep -qx 'status: retired' || fail "retired budget kept its monitor polling: $out"
+printf '%s\n' "$out" >"$home/result"
+$ADAPTER terminal "$home/result" || fail "retired monitor result was not terminal"
+ok "local monitor errors back off and stay registered while retirement ends the source"
+
+home=$(make_home pre-dispatch)
+write_snapshot "$home/far.json" 44 2027-01-15T15:00:00Z
+expect_rc 3 start_guard "$home" "$home/far.json"
+expect_rc 1 run_guard "$home" pause sample --now 1800000010
+run_guard "$home" pause sample --pre-dispatch --now 1800000010 >/dev/null \
+  || fail "a pause raised by start could not finalize before dispatch"
+jq -e '.guard_state == "paused"' "$home/state/sample.resource-budget.json" >/dev/null \
+  || fail "pre-dispatch pause was not durable"
+jq -e '.state == "paused" and .safe_boundary == "pre_dispatch"' "$home/state/sample.resource-pause.json" >/dev/null \
+  || fail "pre-dispatch boundary was not recorded"
+[ ! -e "$home/state/sample.status" ] || fail "pre-dispatch pause invented a worker status"
+expect_rc 3 run_guard "$home" worker-overlay sample
+run_guard "$home" check sample --snapshot "$home/far.json" --now 1800003600 >/dev/null \
+  || fail "near-reset proof did not reopen a pre-dispatch reserve pause"
+run_guard "$home" worker-overlay sample >/dev/null || fail "reopened budget still refused guarded launch"
+home=$(make_home pre-dispatch-refusals)
+write_snapshot "$home/base.json" 80 2030-01-01T00:00:00Z
+write_snapshot "$home/fifteen.json" 65 2030-01-01T00:00:00Z
+start_guard "$home" "$home/base.json" >/dev/null
+expect_rc 3 run_guard "$home" check sample --snapshot "$home/fifteen.json" --now 1800000100
+expect_rc 1 run_guard "$home" pause sample --pre-dispatch --now 1800000101
+home=$(make_home pre-dispatch-worker)
+write_snapshot "$home/far.json" 44 2027-01-15T15:00:00Z
+expect_rc 3 start_guard "$home" "$home/far.json"
+printf 'working [at=1800000005]: already launched\n' >"$home/state/sample.status"
+expect_rc 1 run_guard "$home" pause sample --pre-dispatch --now 1800000010
+ok "a pause raised at start finalizes before dispatch without inventing worker status"
+
 home=$(make_home review)
 write_snapshot "$home/base.json" 80 2030-01-01T00:00:00Z
 start_guard "$home" "$home/base.json" >/dev/null
@@ -592,6 +665,24 @@ EOF
     || fail "captain resume did not start a fresh versioned baseline from current telemetry"
   [ "$(monitor_count "$home")" = 1 ] || fail "captain resume did not re-arm exactly one monitor"
   ok "a captain answer rebaselines reset-discontinuous telemetry and re-arms one monitor"
+
+  home=$(make_home authority-pre-dispatch)
+  write_snapshot "$home/base.json" 80 2030-01-01T00:00:00Z
+  jq -n '{schemaVersion:5,providers:[{provider:"codex",quotaSemantics:{status:"unknown",effectiveAvailability:[]},windows:[]}]}' \
+    >"$home/unavailable.json"
+  expect_rc 3 run_guard "$home" start sample --provider codex --snapshot "$home/unavailable.json" \
+    --attribution exact --no-monitor --now 1800000000
+  run_guard "$home" pause sample --pre-dispatch --now 1800000001 >/dev/null \
+    || fail "unavailable start telemetry could not finalize before dispatch"
+  printf 'resource_budget_points=15\n' >"$home/decision.txt"
+  captain_answer "$home" start-call "$home/decision.txt"
+  run_guard "$home" resume sample --authority-task start-call --decision-file "$home/decision.txt" \
+    --snapshot "$home/base.json" --now 1800000100 >/dev/null \
+    || fail "captain authority could not resume a pre-dispatch unavailable-telemetry pause"
+  jq -e '.guard_state == "active" and .windows[0].baseline_remaining_points == 80' \
+    "$home/state/sample.resource-budget.json" >/dev/null || fail "pre-dispatch captain resume did not establish a baseline"
+  run_guard "$home" worker-overlay sample >/dev/null || fail "captain-resumed budget still refused guarded launch"
+  ok "a pre-dispatch pause reaches exact captain authority and then permits launch"
 else
   ok "captain-authority integration skipped because tasks-axi is unavailable"
 fi

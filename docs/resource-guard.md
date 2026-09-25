@@ -60,6 +60,8 @@ It also never stashes, resets, checks out another branch, cleans files, aborts a
 It records `pause_pending` and wakes Firstmate.
 A failed or malformed quota read during monitoring is recorded the same way, as `telemetry_unavailable` with reason `telemetry_read_failed` over the last known baseline, so the monitor never retires while the budget stays active.
 Every authorized return to active re-arms the task's single monitor registration, and a finalized reserve pause keeps it armed so the near-reset proof can reopen the lane and report `resumed`.
+If reset discontinuity or another telemetry, burn, or attribution reason ends that possibility, the pause escalates to that reason and the monitor reports `awaiting-authority` instead of polling silently.
+Local errors such as lock contention retry with bounded backoff and then report a non-terminal `error`, so the source stays registered.
 
 Firstmate asks the worker to stop at its next safe boundary.
 For ordinary work, that means the current atomic write/test action is complete and all branches/files remain preserved.
@@ -67,6 +69,7 @@ For branch-owning validation, that means the current supported action has reache
 The worker appends its normal `paused` task event only after reaching that point.
 The guard's `pause` command verifies that latest worker event, and that its `[at=<epoch>]` stamp is no older than the pause request, before finalizing `paused`.
 `fm-spawn` refuses to launch a task whose budget is not active.
+A pause raised by `start` itself precedes any guarded dispatch, so `pause --pre-dispatch` finalizes it at the pre-dispatch boundary without a worker event; it refuses a later pause or a task that already has worker status.
 
 This cooperative boundary is portable across worker runtimes and does not weaken the existing validation custody rules.
 

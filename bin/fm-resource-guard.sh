@@ -10,7 +10,7 @@
 #   fm-resource-guard.sh check <task-id> [--snapshot <path|->] [--monitor] [--now <epoch>]
 #   fm-resource-guard.sh milestone <task-id> --type <checks-green|report-accepted|branch-landed|pr-merged>
 #     [--snapshot <path|->] [--now <epoch>]
-#   fm-resource-guard.sh pause <task-id> [--now <epoch>]
+#   fm-resource-guard.sh pause <task-id> [--pre-dispatch] [--now <epoch>]
 #   fm-resource-guard.sh bind-authority <task-id> <captain-hold-task-id>
 #   fm-resource-guard.sh resume <task-id> --authority-task <captain-hold-task-id>
 #     --decision-file <path> [--snapshot <path|->] [--now <epoch>]
@@ -50,7 +50,11 @@
 # monitor only wakes supervision; it never interrupts a worker or a branch-owning
 # validation run. `pause` finalizes the stop only after the worker's own latest
 # status event says `paused` with an [at=<epoch>] no older than the pause
-# request, which is the supported safe ownership boundary. It never invokes
+# request, which is the supported safe ownership boundary. A pause raised by
+# `start` itself happened before any guarded dispatch (fm-spawn refuses a
+# non-active budget), so `pause --pre-dispatch` finalizes exactly that pause at
+# the pre-dispatch boundary without a worker event; it refuses any later pause
+# or a task that already has worker status. It never invokes
 # interrupt, stash, reset, checkout, clean, or force. Every authorized return to
 # active (captain resume, near-reset auto-resume, redesign, re-scope) re-arms
 # the one per-task monitor registration, and a finalized reserve pause keeps it
@@ -570,8 +574,10 @@ evaluate_budget() {
       $b.decision_reason == "reserve_floor" and $reason == null and $lowest_floor < $b.reserve_floor_points) as $auto_resume |
     (if ($b.guard_state == "paused" or $b.guard_state == "pause_pending") and ($auto_resume | not)
      then $b.guard_state else $candidate_state end) as $state |
+    (($b.guard_state == "paused" or $b.guard_state == "pause_pending") and
+      $b.decision_reason == "reserve_floor" and $reason != null and $reason != "reserve_floor") as $escalated |
     (if ($b.guard_state == "paused" or $b.guard_state == "pause_pending") and ($auto_resume | not)
-     then $b.decision_reason else $reason end) as $effective_reason |
+     then (if $escalated then $reason else $b.decision_reason end) else $reason end) as $effective_reason |
     ($b + {
       windows: $windows,
       telemetry_status: (if ($telemetry_reasons | length) == 0 then "known" else "unavailable" end),
@@ -587,6 +593,7 @@ evaluate_budget() {
         state: $state,
         reason: $effective_reason,
         auto_resumed: $auto_resume,
+        escalated: $escalated,
         safe_boundary_required: ($state == "pause_pending"),
         resume_required: (if $state == "active" then "none"
           elif $effective_reason == "reserve_floor" then "auto_near_reset_or_captain"
@@ -645,6 +652,7 @@ evaluate_budget() {
         schema: $pause_schema,
         task_id: $b.task_id,
         requested_at: $ts,
+        raised_by: $kind,
         reason: $effective_reason,
         state: $state,
         safe_boundary: null,
@@ -680,8 +688,10 @@ journal_seal() {
     return 0
   fi
   tmp=$(umask 077; mktemp "${path%/*}/.seal.XXXXXX") || die "cannot stage resource event seal"
-  sha256_file "$path" >"$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$seal" \
-    || { rm -f "$tmp"; die "cannot publish resource event seal: $seal"; }
+  if ! { sha256_file "$path" >"$tmp" && chmod 600 "$tmp" && mv -f "$tmp" "$seal"; }; then
+    rm -f "$tmp"
+    die "cannot publish resource event seal: $seal"
+  fi
 }
 
 journal_sealed() {
@@ -806,6 +816,11 @@ apply_evaluation() {
     publish_evaluation "$id" "$evaluation"
     pause=$(printf '%s\n' "$result" | jq -c --arg event "$EVENT_ID" --arg eval "$EVALUATION_ID" \
       '.pause_base + {trigger_event_id: $event, evaluation_id: $eval}')
+    atomic_json_write "$(pause_path "$id")" "$pause"
+  elif [ "$(printf '%s\n' "$result" | jq -r '.decision.escalated')" = true ] && [ -f "$(pause_path "$id")" ]; then
+    pause=$(jq -ce --arg ts "$(printf '%s\n' "$result" | jq -r '.event_base.ts')" --arg reason "$reason" \
+      --arg event "$EVENT_ID" '.reason=$reason | .escalated_at=$ts | .escalation_event_id=$event' \
+      "$(pause_path "$id")") || die "cannot record resource pause escalation"
     atomic_json_write "$(pause_path "$id")" "$pause"
   elif [ "$(printf '%s\n' "$result" | jq -r '.decision.auto_resumed')" = true ]; then
     if [ -f "$(pause_path "$id")" ]; then
@@ -990,10 +1005,15 @@ latest_status_event() {
 
 cmd_pause() {
   local id=${1:-} now_arg='' now budget pause event status_verb='' status_at='' requested ts
+  local pre_dispatch=0 boundary=worker_reported
   slug_valid "$id" || die "task id must be a privacy-safe slug"
   shift || true
   while [ "$#" -gt 0 ]; do
-    case "$1" in --now) now_arg=${2-}; shift 2 ;; *) usage ;; esac
+    case "$1" in
+      --now) now_arg=${2-}; shift 2 ;;
+      --pre-dispatch) pre_dispatch=1; shift ;;
+      *) usage ;;
+    esac
   done
   now=$(now_resolve "$now_arg")
   ts=$(epoch_iso "$now")
@@ -1002,29 +1022,37 @@ cmd_pause() {
   [ "$(printf '%s\n' "$BUDGET" | jq -r '.guard_state')" = pause_pending ] \
     || die "task $id has no resource pause pending"
   read -r status_verb status_at <<<"$(latest_status_event "$STATE/$id.status" || true)" || true
-  [ "$status_verb" = paused ] \
-    || die "task $id has not reported a safe paused boundary; no lifecycle action was taken"
   pause=$(jq -ce --arg schema "$PAUSE_SCHEMA" --arg task "$id" 'select(.schema == $schema and .task_id == $task)' \
     "$(pause_path "$id")" 2>/dev/null) || die "resource pause record is corrupt for task $id"
-  requested=$(printf '%s\n' "$pause" | jq -er '.requested_at | fromdateiso8601') \
-    || die "resource pause record has no request time for task $id"
-  epoch_valid "$status_at" && [ "$status_at" -ge "$requested" ] \
-    || die "task $id's paused event predates the resource pause request; no lifecycle action was taken"
+  if [ "$pre_dispatch" = 1 ]; then
+    [ "$(printf '%s\n' "$pause" | jq -r '.raised_by // ""')" = task_baseline ] \
+      || die "task $id's resource pause was not raised before dispatch; wait for the worker's safe boundary"
+    [ -z "$status_verb" ] \
+      || die "task $id already has worker status; wait for the worker's safe boundary"
+    boundary=pre_dispatch
+  else
+    [ "$status_verb" = paused ] \
+      || die "task $id has not reported a safe paused boundary; no lifecycle action was taken"
+    requested=$(printf '%s\n' "$pause" | jq -er '.requested_at | fromdateiso8601') \
+      || die "resource pause record has no request time for task $id"
+    epoch_valid "$status_at" && [ "$status_at" -ge "$requested" ] \
+      || die "task $id's paused event predates the resource pause request; no lifecycle action was taken"
+  fi
   budget=$(printf '%s\n' "$BUDGET" | jq -c --arg ts "$ts" '.guard_state="paused" | .paused_at=$ts')
-  event=$(printf '%s\n' "$budget" | jq -c --arg schema "$EVENT_SCHEMA" --arg ts "$ts" '
+  event=$(printf '%s\n' "$budget" | jq -c --arg schema "$EVENT_SCHEMA" --arg ts "$ts" --arg boundary "$boundary" '
     {
       schema:$schema, ts:$ts, kind:"pause", task_id:.task_id,
       budget_id:.budget_id, budget_revision:.revision, provider:.provider,
       account_key:.account_key, model:.model, source:"resource-guard",
       attribution_confidence:.attribution_confidence, concurrent_tasks:.concurrent_tasks,
       windows:.windows,
-      decision:{state:"paused", reason:.decision_reason,
+      decision:{state:"paused", reason:.decision_reason, safe_boundary:$boundary,
         resume_required:(if .decision_reason == "reserve_floor" then "auto_near_reset_or_captain" else "captain_decision_or_redesign" end)},
       milestone:null
     }')
   append_event "$event"
-  pause=$(printf '%s\n' "$pause" | jq -c --arg ts "$ts" --arg event "$EVENT_ID" \
-    '.state="paused" | .safe_boundary="worker_reported" | .paused_at=$ts | .pause_event_id=$event')
+  pause=$(printf '%s\n' "$pause" | jq -c --arg ts "$ts" --arg event "$EVENT_ID" --arg boundary "$boundary" \
+    '.state="paused" | .safe_boundary=$boundary | .paused_at=$ts | .pause_event_id=$event')
   atomic_json_write "$(pause_path "$id")" "$pause"
   atomic_json_write "$(budget_path "$id")" "$budget"
   BUDGET=$budget
@@ -1447,17 +1475,27 @@ cmd_review() {
 }
 
 cmd_monitor() {
-  local id=${1:-} interval='' out rc failures=0
+  local id=${1:-} interval='' out rc failures=0 delay backoff path
   slug_valid "$id" || die "task id must be a privacy-safe slug"
   shift || true
   while [ "$#" -gt 0 ]; do
     case "$1" in --interval) positive_int "${2-}" || die "--interval needs positive integer seconds"; interval=$2; shift 2 ;; *) usage ;; esac
   done
-  load_budget "$id"
-  [ -n "$interval" ] || interval=$(printf '%s\n' "$BUDGET" | jq -r '.monitor_interval_seconds')
+  if [ -z "$interval" ]; then
+    load_budget "$id"
+    interval=$(printf '%s\n' "$BUDGET" | jq -r '.monitor_interval_seconds')
+  fi
   positive_int "$interval" || die "resource budget has invalid monitor interval"
+  path=$(budget_path "$id")
+  delay=$interval
   while :; do
-    sleep "$interval"
+    sleep "$delay"
+    delay=$interval
+    if [ ! -e "$path" ] && [ ! -L "$path" ] || [ "$(jq -r '.guard_state' "$path" 2>/dev/null)" = retired ]; then
+      printf 'resource: %s\n' "$id"
+      printf 'status: retired\n'
+      return 0
+    fi
     rc=0
     out=$("$0" check "$id" --monitor 2>/dev/null) || rc=$?
     case "$rc" in
@@ -1490,11 +1528,21 @@ cmd_monitor() {
         return 0
         ;;
       *)
+        # Local errors such as lock contention retry with bounded backoff. The
+        # error result is not terminal, so the source stays registered and the
+        # runner restarts this monitor after supervision sees it.
         failures=$((failures + 1))
-        [ "$failures" -ge 3 ] || continue
+        if [ "$failures" -lt 3 ]; then
+          backoff=$((interval << failures))
+          [ "$backoff" -le 300 ] || backoff=300
+          [ "$backoff" -ge "$interval" ] || backoff=$interval
+          delay=$backoff
+          continue
+        fi
         printf 'resource: %s\n' "$id"
         printf 'status: error\n'
-        printf 'detail: resource guard check failed without exposing quota payloads\n'
+        printf 'detail: resource guard check failed %s consecutive times without exposing quota payloads\n' "$failures"
+        printf 'action: run fm-resource-guard.sh status %s and repair the named lock or local record; the monitor stays registered\n' "$id"
         return 0
         ;;
     esac
