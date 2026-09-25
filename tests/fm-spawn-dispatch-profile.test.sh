@@ -1479,6 +1479,39 @@ SH
   expect_code 0 "$?" "guarded spawn retry after a failed launch did not succeed: $out"
   [ "$(jq -r .dispatch_state "$HOME_DIR/state/$id.resource-budget.json")" = dispatched ] \
     || fail "guarded spawn retry did not record its dispatch"
+
+  for delivery_failure in literal key; do
+    id=resource-overlay-failed-$delivery_failure
+    rec=$(make_spawn_case "$id" codex)
+    read_case_record "$rec"
+    fm_test_spawn_brief "$HOME_DIR" "$id"
+    jq -n --arg task "$id" '{
+      schema:"fm.task-resource-budget.v1",task_id:$task,provider:"codex",
+      guard_state:"active",dispatch_state:"pre_dispatch",monitor_enabled:false,
+      decision_reason:null,windows:[],review:{},revision:1
+    }' >"$HOME_DIR/state/$id.resource-budget.json"
+    mv "$FAKEBIN_DIR/tmux" "$FAKEBIN_DIR/tmux.real"
+    cat >"$FAKEBIN_DIR/tmux" <<SH
+#!/usr/bin/env bash
+literal=
+for arg in "\$@"; do [ "\$arg" = -l ] && literal=1; done
+if [ "\${1:-}" = send-keys ] && [ -n "\$literal" ]; then
+  if [ "\${FM_FAIL_DELIVERY:-}" = literal ]; then exit 1; fi
+  : >"$CASE_DIR/literal-delivered"
+fi
+if [ "\${1:-}" = send-keys ] && [ "\${FM_FAIL_DELIVERY:-}" = key ] &&
+  [ -e "$CASE_DIR/literal-delivered" ] && [ "\$#" -eq 4 ] && [ "\${4:-}" = Enter ]; then
+  exit 1
+fi
+exec "$FAKEBIN_DIR/tmux.real" "\$@"
+SH
+    chmod +x "$FAKEBIN_DIR/tmux"
+    out=$(FM_FAIL_DELIVERY=$delivery_failure \
+      run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --mode no-mistakes --yolo off)
+    [ "$?" -ne 0 ] || fail "$delivery_failure delivery failure unexpectedly completed the spawn: $out"
+    [ "$(jq -r .dispatch_state "$HOME_DIR/state/$id.resource-budget.json")" = pre_dispatch ] \
+      || fail "$delivery_failure delivery failure left the resource budget dispatched"
+  done
   pass "fm-spawn: guarded tasks carry the shared boundary, record dispatch once, and non-active budgets refuse launch"
 }
 
