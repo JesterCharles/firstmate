@@ -1,0 +1,34 @@
+ok - help renders only the complete owner header
+ok - baseline binds overlapping windows and emits a private versioned event
+ok - one evaluator handles providers centrally and refuses ambiguous or non-private account selection
+ok - start retries are idempotent and task-start drift is refused
+ok - concurrent tasks serialize the shared append-only event journal
+ok - event publication enforces a private 90-day retention horizon
+ok - the strictest overlapping window wins independently
+ok - reserve boundary treats equality as safe
+ok - near-reset floors use exact time boundaries and require safe runway plus tranche proof
+ok - 15-point task burn creates an immutable trigger evaluation
+ok - concurrent use remains shared and triggers conservative review without fabricated precision
+ok - unavailable and malformed telemetry stop safely without invented percentages
+ok - window reset transitions pause instead of rebasing an invented exact burn
+ok - pause waits for a worker boundary and only the proved near-reset rule resumes automatically
+ok - pause requires a paused boundary no older than the pause request
+ok - monitor-time unavailable or malformed telemetry pauses cooperatively instead of retiring unguarded
+ok - a reserve pause keeps one monitor armed and its near-reset proof resumes without retiring it
+ok - a reserve-paused monitor escalates to durable authority when reset discontinuity ends near-reset proof
+ok - local monitor errors back off and stay registered while retirement ends the source
+ok - a pause raised at start finalizes before dispatch without inventing worker status
+ok - pending-pause escalation keeps the original request so delivered and pre-dispatch boundaries still finalize
+ok - bounded review stops same-theme loops and permits an explicit redesign with final full review
+ok - final review requires critic resolution and corrected-head delta evidence
+ok - delta review is bounded to one pass and any post-correction failure stops alternating-theme loops
+ok - hostile and corrupt local events are inert and block partial publication
+ok - event digests are re-verified whenever the journal changes outside the guard
+ok - a non-active budget refuses the guarded worker overlay
+ok - guard records minimize telemetry to privacy-safe budget fields
+ok - resume spends one exact durable captain answer without copying its text
+ok - a captain answer rebaselines reset-discontinuous telemetry and re-arms one monitor
+ok - a pre-dispatch pause reaches exact captain authority and then permits launch
+ok - process-event adapter remains a thin terminal classifier
+ok - resource monitor registration and retirement use the generic process-event lifecycle idempotently
+all resource guard tests passed
