@@ -54,7 +54,7 @@ Do not turn uncertainty into zero spend or an exact estimate.
 Run `start` after the task record and instructions exist but before `fm-spawn`.
 A healthy start registers the monitor, and `fm-spawn` injects the harness-independent safe-boundary overlay when the budget record exists.
 A pause result at start means do not dispatch; `fm-spawn` also refuses any budget that is not active.
-Finalize that pause with `fm-resource-guard.sh pause <task-id> --pre-dispatch`, then resume only through the near-reset proof or captain authority below.
+Finalize that pause, or any pause raised before `fm-spawn` recorded the dispatch, with `fm-resource-guard.sh pause <task-id> --pre-dispatch`, then resume only through the near-reset proof or captain authority below.
 An unavailable or ambiguous provider/account/scope result is a real blocker to unguarded dispatch; correct the selection or escalate the uncertainty rather than inventing a value.
 
 ## Handle a resource notification

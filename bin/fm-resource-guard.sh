@@ -10,6 +10,7 @@
 #   fm-resource-guard.sh check <task-id> [--snapshot <path|->] [--monitor] [--now <epoch>]
 #   fm-resource-guard.sh milestone <task-id> --type <checks-green|report-accepted|branch-landed|pr-merged>
 #     [--snapshot <path|->] [--now <epoch>]
+#   fm-resource-guard.sh dispatch <task-id> [--rollback <dispatched-at>] [--now <epoch>]
 #   fm-resource-guard.sh pause <task-id> [--pre-dispatch] [--now <epoch>]
 #   fm-resource-guard.sh bind-authority <task-id> <captain-hold-task-id>
 #   fm-resource-guard.sh resume <task-id> --authority-task <captain-hold-task-id>
@@ -50,11 +51,14 @@
 # monitor only wakes supervision; it never interrupts a worker or a branch-owning
 # validation run. `pause` finalizes the stop only after the worker's own latest
 # status event says `paused` with an [at=<epoch>] no older than the pause
-# request, which is the supported safe ownership boundary. A pause raised by
-# `start` itself happened before any guarded dispatch (fm-spawn refuses a
-# non-active budget), so `pause --pre-dispatch` finalizes exactly that pause at
-# the pre-dispatch boundary without a worker event; it refuses any later pause
-# or a task that already has worker status. It never invokes
+# request, which is the supported safe ownership boundary. Every budget starts
+# in the durable `pre_dispatch` lifecycle. fm-spawn moves it to `dispatched`
+# exactly once through `dispatch` (active budgets only) before launch delivery,
+# and rolls that transition back with its `--rollback <dispatched-at>` token if
+# the spawn fails before the worker command is delivered. While the lifecycle is
+# still `pre_dispatch` no worker exists to stop, so `pause --pre-dispatch`
+# finalizes any pending pause at the pre-dispatch boundary without a worker
+# event; once dispatched, worker safe-boundary evidence is mandatory. It never invokes
 # interrupt, stash, reset, checkout, clean, or force. Every authorized return to
 # active (captain resume, near-reset auto-resume, redesign, re-scope) re-arms
 # the one per-task monitor registration, and a finalized reserve pause keeps it
@@ -449,6 +453,7 @@ build_baseline_budget() {
       baseline_telemetry_reasons: $telemetry_reasons,
       telemetry_reasons: $telemetry_reasons,
       guard_state: "active",
+      dispatch_state: "pre_dispatch",
       decision_reason: null,
       windows: $budget_windows,
       review: {
@@ -1031,8 +1036,8 @@ cmd_pause() {
   pause=$(jq -ce --arg schema "$PAUSE_SCHEMA" --arg task "$id" 'select(.schema == $schema and .task_id == $task)' \
     "$(pause_path "$id")" 2>/dev/null) || die "resource pause record is corrupt for task $id"
   if [ "$pre_dispatch" = 1 ]; then
-    [ "$(printf '%s\n' "$pause" | jq -r '.raised_by // ""')" = task_baseline ] \
-      || die "task $id's resource pause was not raised before dispatch; wait for the worker's safe boundary"
+    [ "$(printf '%s\n' "$BUDGET" | jq -r '.dispatch_state // "dispatched"')" = pre_dispatch ] \
+      || die "task $id has been dispatched; wait for the worker's safe boundary"
     [ -z "$status_verb" ] \
       || die "task $id already has worker status; wait for the worker's safe boundary"
     boundary=pre_dispatch
@@ -1068,6 +1073,49 @@ cmd_pause() {
     rearm_monitor "$id"
   fi
   printf 'paused: %s reason=%s\n' "$id" "$(printf '%s\n' "$budget" | jq -r '.decision_reason')"
+}
+
+cmd_dispatch() {
+  local id=${1:-} rollback='' now_arg='' now ts budget current
+  slug_valid "$id" || die "task id must be a privacy-safe slug"
+  shift || true
+  while [ "$#" -gt 0 ]; do
+    case "$1" in
+      --rollback) [ -n "${2-}" ] || die "--rollback needs the dispatched-at token"; rollback=$2; shift 2 ;;
+      --now) now_arg=${2-}; shift 2 ;;
+      *) usage ;;
+    esac
+  done
+  lock_acquire "$id"
+  load_budget "$id"
+  current=$(printf '%s\n' "$BUDGET" | jq -r '.dispatch_state // "dispatched"')
+  if [ -n "$rollback" ]; then
+    if [ "$current" = dispatched ] && [ "$(printf '%s\n' "$BUDGET" | jq -r '.dispatched_at // ""')" = "$rollback" ]; then
+      budget=$(printf '%s\n' "$BUDGET" | jq -c '.dispatch_state="pre_dispatch" | del(.dispatched_at)')
+      atomic_json_write "$(budget_path "$id")" "$budget"
+      printf 'dispatch-rolled-back: %s\n' "$id"
+    else
+      printf 'dispatch-unchanged: %s\n' "$id"
+    fi
+    return 0
+  fi
+  if [ "$(printf '%s\n' "$BUDGET" | jq -r '.guard_state')" != active ]; then
+    printf 'error: task %s resource budget is %s; do not dispatch until the guard authorizes it\n' \
+      "$id" "$(printf '%s\n' "$BUDGET" | jq -r '.guard_state')" >&2
+    exit 3
+  fi
+  if [ "$current" = dispatched ]; then
+    rearm_monitor "$id"
+    printf 'already-dispatched: %s at=%s\n' "$id" "$(printf '%s\n' "$BUDGET" | jq -r '.dispatched_at // ""')"
+    return 0
+  fi
+  now=$(now_resolve "$now_arg")
+  ts=$(epoch_iso "$now")
+  budget=$(printf '%s\n' "$BUDGET" | jq -c --arg ts "$ts" '.dispatch_state="dispatched" | .dispatched_at=$ts')
+  atomic_json_write "$(budget_path "$id")" "$budget"
+  BUDGET=$budget
+  rearm_monitor "$id"
+  printf 'dispatched: %s at=%s\n' "$id" "$ts"
 }
 
 cmd_bind_authority() {
@@ -1593,7 +1641,7 @@ cmd_status() {
   slug_valid "$id" || die "task id must be a privacy-safe slug"
   [ "$#" -eq 1 ] || usage
   load_budget "$id"
-  printf '%s\n' "$BUDGET" | jq -c '{schema,task_id,budget_id,revision,provider,account_key,model,guard_state,decision_reason,telemetry_status,attribution_confidence,concurrent_tasks,windows,review}'
+  printf '%s\n' "$BUDGET" | jq -c '{schema,task_id,budget_id,revision,provider,account_key,model,guard_state,dispatch_state,decision_reason,telemetry_status,attribution_confidence,concurrent_tasks,windows,review}'
 }
 
 cmd_worker_overlay() {
@@ -1626,6 +1674,7 @@ case "${1-}" in
   start) shift; cmd_start "$@" ;;
   check) shift; cmd_check "$@" ;;
   milestone) shift; cmd_milestone "$@" ;;
+  dispatch) shift; cmd_dispatch "$@" ;;
   pause) shift; cmd_pause "$@" ;;
   bind-authority) shift; cmd_bind_authority "$@" ;;
   resume) shift; cmd_resume "$@" ;;

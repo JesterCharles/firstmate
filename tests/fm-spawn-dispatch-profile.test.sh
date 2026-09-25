@@ -1396,7 +1396,8 @@ test_worker_launch_carries_resource_boundary() {
   fm_test_spawn_brief "$HOME_DIR" "$id"
   jq -n --arg task "$id" '{
     schema:"fm.task-resource-budget.v1",task_id:$task,provider:"codex",
-    guard_state:"active",decision_reason:null,windows:[],review:{},revision:1
+    guard_state:"active",dispatch_state:"pre_dispatch",monitor_enabled:false,
+    decision_reason:null,windows:[],review:{},revision:1
   }' >"$HOME_DIR/state/$id.resource-budget.json"
   cat > "$FAKEBIN_DIR/codex" <<'SH'
 #!/usr/bin/env bash
@@ -1405,6 +1406,8 @@ SH
   chmod +x "$FAKEBIN_DIR/codex"
   out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --mode no-mistakes --yolo off)
   expect_code 0 "$?" "resource-guarded worker spawn failed: $out"
+  [ "$(jq -r .dispatch_state "$HOME_DIR/state/$id.resource-budget.json")" = dispatched ] \
+    || fail "successful guarded launch did not record its dispatch"
   launch=$(cat "$LAUNCH_LOG")
   envelope="$CASE_DIR/resource-prompt-envelope"
   encoded="$CASE_DIR/resource-encoded-prompt"
@@ -1449,7 +1452,34 @@ SH
       "$state resource budget refusal did not name the pause"
     [ ! -s "$LAUNCH_LOG" ] || fail "$state resource budget still reached the launch command"
   done
-  pass "fm-spawn: guarded tasks carry the shared boundary and corrupt or non-active budgets refuse launch"
+
+  id=resource-overlay-failed-launch
+  rec=$(make_spawn_case "$id" codex)
+  read_case_record "$rec"
+  fm_test_spawn_brief "$HOME_DIR" "$id"
+  jq -n --arg task "$id" '{
+    schema:"fm.task-resource-budget.v1",task_id:$task,provider:"codex",
+    guard_state:"active",dispatch_state:"pre_dispatch",monitor_enabled:false,
+    decision_reason:null,windows:[],review:{},revision:1
+  }' >"$HOME_DIR/state/$id.resource-budget.json"
+  mv "$FAKEBIN_DIR/tmux" "$FAKEBIN_DIR/tmux.real"
+  cat >"$FAKEBIN_DIR/tmux" <<SH
+#!/usr/bin/env bash
+if [ "\${1:-}" = new-window ] && [ -e "$CASE_DIR/fail-new-window" ]; then exit 1; fi
+exec "$FAKEBIN_DIR/tmux.real" "\$@"
+SH
+  chmod +x "$FAKEBIN_DIR/tmux"
+  : >"$CASE_DIR/fail-new-window"
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --mode no-mistakes --yolo off)
+  [ "$?" -ne 0 ] || fail "failing endpoint creation unexpectedly launched a worker: $out"
+  [ "$(jq -r .dispatch_state "$HOME_DIR/state/$id.resource-budget.json")" = pre_dispatch ] \
+    || fail "a spawn that failed before launch delivery left the budget dispatched"
+  rm -f "$CASE_DIR/fail-new-window"
+  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --mode no-mistakes --yolo off)
+  expect_code 0 "$?" "guarded spawn retry after a failed launch did not succeed: $out"
+  [ "$(jq -r .dispatch_state "$HOME_DIR/state/$id.resource-budget.json")" = dispatched ] \
+    || fail "guarded spawn retry did not record its dispatch"
+  pass "fm-spawn: guarded tasks carry the shared boundary, record dispatch once, and non-active budgets refuse launch"
 }
 
 # config/claude-permission-mode (bin/fm-spawn.sh header): absent and `bypass`

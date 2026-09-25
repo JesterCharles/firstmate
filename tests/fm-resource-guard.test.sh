@@ -465,10 +465,30 @@ expect_rc 3 run_guard "$home" worker-overlay sample
 run_guard "$home" check sample --snapshot "$home/far.json" --now 1800003600 >/dev/null \
   || fail "near-reset proof did not reopen a pre-dispatch reserve pause"
 run_guard "$home" worker-overlay sample >/dev/null || fail "reopened budget still refused guarded launch"
+home=$(make_home pre-dispatch-check)
+write_snapshot "$home/base.json" 80 2030-01-01T00:00:00Z
+write_snapshot "$home/fifteen.json" 65 2030-01-01T00:00:00Z
+start_guard "$home" "$home/base.json" >/dev/null
+expect_rc 3 run_guard "$home" check sample --snapshot "$home/fifteen.json" --now 1800000100
+run_guard "$home" pause sample --pre-dispatch --now 1800000101 >/dev/null \
+  || fail "a check pause raised before dispatch could not finalize"
+jq -e '.guard_state == "paused" and .dispatch_state == "pre_dispatch"' \
+  "$home/state/sample.resource-budget.json" >/dev/null || fail "pre-dispatch check pause was not finalized"
+expect_rc 3 run_guard "$home" dispatch sample --now 1800000102
 home=$(make_home pre-dispatch-refusals)
 write_snapshot "$home/base.json" 80 2030-01-01T00:00:00Z
 write_snapshot "$home/fifteen.json" 65 2030-01-01T00:00:00Z
 start_guard "$home" "$home/base.json" >/dev/null
+out=$(run_guard "$home" dispatch sample --now 1800000050) || fail "active budget refused dispatch"
+token=${out##*at=}
+[ "$(run_guard "$home" dispatch sample --rollback 2000-01-01T00:00:00Z)" = 'dispatch-unchanged: sample' ] \
+  || fail "a mismatched rollback token changed the dispatch lifecycle"
+run_guard "$home" dispatch sample --rollback "$token" >/dev/null
+[ "$(jq -r .dispatch_state "$home/state/sample.resource-budget.json")" = pre_dispatch ] \
+  || fail "failed-launch rollback did not return the budget to pre-dispatch"
+out=$(run_guard "$home" dispatch sample --now 1800000060) || fail "dispatch retry after rollback failed"
+run_guard "$home" dispatch sample --now 1800000070 | grep -q '^already-dispatched: sample ' \
+  || fail "a second dispatch was not idempotent"
 expect_rc 3 run_guard "$home" check sample --snapshot "$home/fifteen.json" --now 1800000100
 expect_rc 1 run_guard "$home" pause sample --pre-dispatch --now 1800000101
 home=$(make_home pre-dispatch-worker)

@@ -69,7 +69,8 @@ For branch-owning validation, that means the current supported action has reache
 The worker appends its normal `paused` task event only after reaching that point.
 The guard's `pause` command verifies that latest worker event, and that its `[at=<epoch>]` stamp is no older than the pause request, before finalizing `paused`.
 `fm-spawn` refuses to launch a task whose budget is not active.
-A pause raised by `start` itself precedes any guarded dispatch, so `pause --pre-dispatch` finalizes it at the pre-dispatch boundary without a worker event; it refuses a later pause or a task that already has worker status.
+Every budget starts in the durable `pre_dispatch` lifecycle; a guarded `fm-spawn` records the one `dispatched` transition before launch delivery and rolls it back if the spawn aborts before the worker command is delivered.
+While the budget is still `pre_dispatch`, no worker exists to stop, so `pause --pre-dispatch` finalizes any pending pause without a worker event, whether `start`, a check, a milestone, or the monitor raised it; once dispatched, worker safe-boundary evidence is mandatory.
 
 This cooperative boundary is portable across worker runtimes and does not weaken the existing validation custody rules.
 

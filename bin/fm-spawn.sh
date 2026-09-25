@@ -27,7 +27,9 @@
 #   also carries bin/fm-resource-guard.sh's cooperative safe-boundary contract.
 #   The budget is created before dispatch, and an unsafe or corrupt record, or
 #   one that is not active, stops the spawn instead of launching an unguarded
-#   or paused heavy lane. For a no-mistakes
+#   or paused heavy lane. A guarded launch records the budget's one durable
+#   `dispatched` transition before delivery and rolls it back if the spawn
+#   aborts before the worker command is delivered. For a no-mistakes
 #   ship the launch brief also carries the current `--intent` contract and the
 #   extracted captain intent. A legacy mixed Task is accepted there only under
 #   bin/fm-dod-lib.sh's
@@ -1175,6 +1177,7 @@ RELAUNCH_REPLACEMENT_STATE=
 RELAUNCH_REPLACEMENT_WT=
 CONFIG_INHERIT_LOCK=
 CONFIG_INHERIT_LOCK_HELD=0
+RESOURCE_DISPATCH_TOKEN=
 
 spawn_fresh_commit_rollback() {
   if fm_backlog_atomic_transition rollback "$STATE/$ID.meta" \
@@ -1205,6 +1208,12 @@ parse_orca_worktree_result() {
 
 spawn_abort_cleanup() {
   local status=$?
+  if [ "$status" -ne 0 ] && [ -n "$RESOURCE_DISPATCH_TOKEN" ]; then
+    FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_DATA_OVERRIDE="$DATA" \
+      "$SCRIPT_DIR/fm-resource-guard.sh" dispatch "$ID" --rollback "$RESOURCE_DISPATCH_TOKEN" >/dev/null ||
+      echo "warning: could not return task $ID's resource budget to pre-dispatch after the aborted spawn" >&2
+    RESOURCE_DISPATCH_TOKEN=
+  fi
   if [ "$RELAUNCH_REPLACEMENT_PENDING" = 1 ] &&
     [ "$SPAWN_META_PUBLISH_STARTED" = 1 ] &&
     [ -n "$SPAWN_META_TMP" ] &&
@@ -2875,6 +2884,16 @@ if [ "$KIND" = ship ] || [ "$KIND" = scout ]; then
       echo "error: task $ID has an unsafe or corrupt resource budget; refusing to launch it unguarded" >&2
       exit 1
     fi
+    RESOURCE_RC=0
+    RESOURCE_DISPATCH=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_DATA_OVERRIDE="$DATA" \
+      "$SCRIPT_DIR/fm-resource-guard.sh" dispatch "$ID") || RESOURCE_RC=$?
+    if [ "$RESOURCE_RC" -ne 0 ]; then
+      echo "error: task $ID's resource budget could not record its dispatch; refusing to launch it" >&2
+      exit 1
+    fi
+    case "$RESOURCE_DISPATCH" in
+      "dispatched: $ID at="*) RESOURCE_DISPATCH_TOKEN=${RESOURCE_DISPATCH##*at=} ;;
+    esac
   fi
   SOURCE_BRIEF=$BRIEF
   BRIEF="$DATA/$ID/launch-brief.md"
@@ -5061,6 +5080,7 @@ if ! (umask 077 && printf '%s\n' "$LAUNCH" >"$LAUNCH_STAGE" &&
   exit 1
 fi
 sleep 0.3
+RESOURCE_DISPATCH_TOKEN=
 spawn_send_literal "$T" ". $(shell_quote "$LAUNCH_FILE")"
 sleep 0.3
 if [ "${HERDR_PROJECTED:-0}" -eq 1 ]; then
