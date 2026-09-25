@@ -22,9 +22,14 @@
 #   ship or scout spawn also refuses leftover `{TASK}` / `{FIRSTMATE_SPEC}`
 #   placeholders, an empty Task, an incomplete pair of Task subsections, or a
 #   `## Captain's intent` line opening with a Captain label or address.
-#   Every ship or scout spawn renders `launch-brief.md`; for a no-mistakes ship
-#   it also carries the current `--intent` contract and the extracted captain
-#   intent. A legacy mixed Task is accepted there only under bin/fm-dod-lib.sh's
+#   Every ship or scout spawn renders `launch-brief.md`; when this home already
+#   carries state/<id>.resource-budget.json, the same harness-independent overlay
+#   also carries bin/fm-resource-guard.sh's cooperative safe-boundary contract.
+#   The budget is created before dispatch, and an unsafe or corrupt record stops
+#   the spawn instead of launching an unguarded heavy lane. For a no-mistakes
+#   ship the launch brief also carries the current `--intent` contract and the
+#   extracted captain intent. A legacy mixed Task is accepted there only under
+#   bin/fm-dod-lib.sh's
 #   provenance-marking rules; unmarked legacy Tasks stop for migration rather
 #   than becoming intent. That library owns the parsing and intent rules. When
 #   the explicit mode carries less rigor than the project's standing posture, a
@@ -2854,6 +2859,17 @@ if [ "$KIND" = ship ] || [ "$KIND" = scout ]; then
   fi
   # Use the existing launch-brief overlay for every worker kind, including
   # pre-scope briefs and relaunches. Charters never enter this worker path.
+  # A resource overlay is rendered before the no-mistakes intent overlay: that
+  # intent section consumes through end-of-file, so nothing authored by
+  # firstmate may follow it and accidentally become captain intent.
+  RESOURCE_OVERLAY=
+  if [ -e "$STATE/$ID.resource-budget.json" ] || [ -L "$STATE/$ID.resource-budget.json" ]; then
+    RESOURCE_OVERLAY=$(FM_HOME="$FM_HOME" FM_STATE_OVERRIDE="$STATE" FM_DATA_OVERRIDE="$DATA" \
+      "$SCRIPT_DIR/fm-resource-guard.sh" worker-overlay "$ID") || {
+      echo "error: task $ID has an unsafe or corrupt resource budget; refusing to launch it unguarded" >&2
+      exit 1
+    }
+  fi
   SOURCE_BRIEF=$BRIEF
   BRIEF="$DATA/$ID/launch-brief.md"
   BRIEF_TMP="$DATA/$ID/.launch-brief.md.${BASHPID:-$$}"
@@ -2861,6 +2877,9 @@ if [ "$KIND" = ship ] || [ "$KIND" = scout ]; then
     fm_brief_worker_role "$STATE" "$ID" &&
       printf '\n' &&
       cat "$SOURCE_BRIEF" &&
+      if [ -n "$RESOURCE_OVERLAY" ]; then
+        printf '%s\n' "$RESOURCE_OVERLAY"
+      fi &&
       if [ "$KIND" = ship ] && [ "$MODE" = no-mistakes ]; then
         fm_brief_intent_overlay "$CAPTAIN_INTENT"
       fi
