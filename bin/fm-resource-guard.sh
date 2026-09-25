@@ -329,7 +329,13 @@ snapshot_read() {
            (if $c.sign == "+" then 1 else -1 end)) end) as $offset |
         if $mo < 1 or $mo > 12 or $d < 1 or $d > 31 or $h > 23 or $mi > 59 or $sec > 59 or
            ($c.zone != "Z" and (($c.oh|tonumber) > 23 or ($c.om|tonumber) > 59))
-        then null else ([$y,($mo - 1),$d,$h,$mi,$sec,0,0] | mktime) - $offset end
+        then null
+        else ([$y,($mo - 1),$d,$h,$mi,$sec,0,0] | mktime) as $local |
+          ($local | gmtime) as $normalized |
+          if $normalized[0] != $y or $normalized[1] != ($mo - 1) or $normalized[2] != $d or
+             $normalized[3] != $h or $normalized[4] != $mi or $normalized[5] != $sec
+          then null else $local - $offset end
+        end
       ) catch null;
     all(.providers[];
       ((.windows // []) | type) == "array" and
@@ -1454,16 +1460,33 @@ cmd_review() {
       creator_actor=$(printf '%s\n' "$review" | jq -r '.creator.actor // ""')
       creator_head=$(printf '%s\n' "$review" | jq -r '.creator.head // ""')
       [ -n "$creator_actor" ] || die "final review requires the creator pass"
+      [ "$(printf '%s\n' "$review" | jq -r '.critic // empty')" != "" ] \
+        || die "final review requires the independent critic pass"
+      if [ "$(printf '%s\n' "$review" | jq -r '.corrections | length')" -eq 0 ]; then
+        [ "$(printf '%s\n' "$review" | jq -r '.consecutive_same_theme_failures')" -eq 0 ] \
+          || die "final review cannot bypass an unresolved critic failure"
+        [ "$head" = "$creator_head" ] \
+          || die "an uncorrected final review must cover the frozen creator head"
+      else
+        [ "$(printf '%s\n' "$review" | jq -r '.corrections | length')" -eq 1 ] \
+          || die "final review requires exactly one accepted correction pass"
+        [ "$(printf '%s\n' "$review" | jq -r '.deltas | length')" -eq 1 ] \
+          || die "a corrected final head requires its focused delta review"
+        [ "$(printf '%s\n' "$review" | jq -r '.post_correction_failures // 0')" -eq 0 ] \
+          || die "final review cannot bypass a failed correction or delta review"
+        [ "$head" = "$(printf '%s\n' "$review" | jq -r '.corrections[0].head')" ] \
+          || die "final review must cover the corrected head"
+        [ "$head" = "$(printf '%s\n' "$review" | jq -r '.deltas[0].head')" ] \
+          || die "final review must cover the delta-reviewed head"
+      fi
       [ "$actor" != "$creator_actor" ] || die "final review must be an independent session"
       creator_provider=$(printf '%s\n' "$review" | jq -r '.creator.provider')
       creator_family=$(printf '%s\n' "$review" | jq -r '.creator.model_family')
       if [ "$provider:$family" = "$creator_provider:$creator_family" ] && [ -z "$same_reason" ]; then
         die "same provider/model-family final review requires --same-family-reason"
       fi
-      if [ "$head" = "$creator_head" ]; then
-        [ "$(printf '%s\n' "$review" | jq -r '.critic.head // ""')" = "$head" ] \
-          || die "unchanged final head still requires its independent full critic pass"
-      fi
+      [ "$(printf '%s\n' "$review" | jq -r '.critic.head // ""')" = "$creator_head" ] \
+        || die "final review requires the critic of the frozen creator head"
       [ "$(printf '%s\n' "$review" | jq -r '.final // empty')" = "" ] \
         || die "final independent review is already recorded"
       review=$(printf '%s\n' "$review" | jq -c --arg head "$head" --arg actor "$actor" --arg ts "$ts" \

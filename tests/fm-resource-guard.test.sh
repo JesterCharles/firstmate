@@ -302,6 +302,10 @@ write_snapshot "$home/malformed.json" 70 not-a-time
 expect_rc 1 run_guard "$home" check sample --snapshot "$home/malformed.json" --now 1800000200
 cmp -s "$home/before-malformed.json" "$home/state/sample.resource-budget.json" \
   || fail "malformed telemetry mutated the previous guarded state"
+write_snapshot "$home/impossible-date.json" 70 2027-02-31T06:00:00-04:00
+expect_rc 1 run_guard "$home" check sample --snapshot "$home/impossible-date.json" --now 1800000200
+cmp -s "$home/before-malformed.json" "$home/state/sample.resource-budget.json" \
+  || fail "an impossible reset date mutated the previous guarded state"
 ok "unavailable and malformed telemetry stop safely without invented percentages"
 
 home=$(make_home reset-transition)
@@ -558,6 +562,24 @@ jq -e '.guard_state == "active" and .review.final.scope == "full" and .review.fi
   (.review.redesigns | length) == 1' "$home/state/sample.resource-budget.json" >/dev/null \
   || fail "redesign and final independent review were not recorded"
 ok "bounded review stops same-theme loops and permits an explicit redesign with final full review"
+
+home=$(make_home review-final-sequence)
+write_snapshot "$home/base.json" 80 2030-01-01T00:00:00Z
+start_guard "$home" "$home/base.json" >/dev/null
+run_guard "$home" review sample creator --head aaaaaaa --actor creator-1 --provider codex --family gpt5 --now 1800000010 >/dev/null
+expect_rc 1 run_guard "$home" review sample final --head bbbbbbb --actor final-1 --provider claude --family sonnet --now 1800000020
+run_guard "$home" review sample critic --head aaaaaaa --actor critic-1 --provider claude --family sonnet --now 1800000030 >/dev/null
+run_guard "$home" review sample failure --head aaaaaaa --actor critic-1 --provider claude --family sonnet --theme theme-a --now 1800000040 >/dev/null
+expect_rc 1 run_guard "$home" review sample final --head bbbbbbb --actor final-1 --provider claude --family sonnet --now 1800000050
+run_guard "$home" review sample correction --head bbbbbbb --actor creator-1 --provider codex --family gpt5 --theme theme-a --now 1800000060 >/dev/null
+expect_rc 1 run_guard "$home" review sample final --head bbbbbbb --actor final-1 --provider claude --family sonnet --now 1800000070
+run_guard "$home" review sample delta --head bbbbbbb --actor critic-1 --provider claude --family sonnet --theme theme-a --now 1800000080 >/dev/null
+run_guard "$home" review sample final --head bbbbbbb --actor final-1 --provider claude --family sonnet --now 1800000090 >/dev/null \
+  || fail "completed correction and delta sequence did not permit final review"
+jq -e '.review.final.head == "bbbbbbb" and (.review.deltas | length) == 1' \
+  "$home/state/sample.resource-budget.json" >/dev/null \
+  || fail "final review did not preserve the completed predecessor sequence"
+ok "final review requires critic resolution and corrected-head delta evidence"
 
 home=$(make_home review-bound)
 write_snapshot "$home/base.json" 80 2030-01-01T00:00:00Z
