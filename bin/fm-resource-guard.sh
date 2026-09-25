@@ -1350,7 +1350,7 @@ cmd_review() {
       return 0
     fi
     if [ "$(printf '%s\n' "$review" | jq -r '.deltas | length')" -gt 0 ]; then
-      failure_stage=delta
+      failure_stage="delta"
     else
       failure_stage=critic
     fi

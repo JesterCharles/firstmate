@@ -1470,8 +1470,9 @@ exec "$FAKEBIN_DIR/tmux.real" "\$@"
 SH
   chmod +x "$FAKEBIN_DIR/tmux"
   : >"$CASE_DIR/fail-new-window"
-  out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --mode no-mistakes --yolo off)
-  [ "$?" -ne 0 ] || fail "failing endpoint creation unexpectedly launched a worker: $out"
+  if out=$(run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --mode no-mistakes --yolo off); then
+    fail "failing endpoint creation unexpectedly launched a worker: $out"
+  fi
   [ "$(jq -r .dispatch_state "$HOME_DIR/state/$id.resource-budget.json")" = pre_dispatch ] \
     || fail "a spawn that failed before launch delivery left the budget dispatched"
   rm -f "$CASE_DIR/fail-new-window"
@@ -1506,9 +1507,10 @@ fi
 exec "$FAKEBIN_DIR/tmux.real" "\$@"
 SH
     chmod +x "$FAKEBIN_DIR/tmux"
-    out=$(FM_FAIL_DELIVERY=$delivery_failure \
-      run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --mode no-mistakes --yolo off)
-    [ "$?" -ne 0 ] || fail "$delivery_failure delivery failure unexpectedly completed the spawn: $out"
+    if out=$(FM_FAIL_DELIVERY=$delivery_failure \
+      run_spawn "$HOME_DIR" "$WT_DIR" "$FAKEBIN_DIR" "$LAUNCH_LOG" "$id" "$PROJ_DIR" --mode no-mistakes --yolo off); then
+      fail "$delivery_failure delivery failure unexpectedly completed the spawn: $out"
+    fi
     [ "$(jq -r .dispatch_state "$HOME_DIR/state/$id.resource-budget.json")" = pre_dispatch ] \
       || fail "$delivery_failure delivery failure left the resource budget dispatched"
   done
