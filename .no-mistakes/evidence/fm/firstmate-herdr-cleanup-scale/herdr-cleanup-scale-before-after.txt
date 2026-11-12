@@ -1,0 +1,12 @@
+== AFTER (048db95a) bash tests/fm-herdr-session-cleanup.test.sh ==
+ok - active target preserves the candidate
+ok - focus refusal preserves the candidate
+ok - 100 projected workspaces and 50 home journals complete in 2s within the 20s bound while metadata-backed work is preserved
+ok - standalone bootstrap cannot run lock-owned stale projection cleanup
+ok - session start runs cleanup only after acquiring its home lock
+all fm-herdr-session-cleanup tests passed
+
+== BEFORE (base bf0f3468 cleanup script, same test; metadata-lock assert relaxed to reach scale case) ==
+ok - active target preserves the candidate
+ok - focus refusal preserves the candidate
+not ok - 100-workspace/50-journal cleanup exceeded its 20s bound or failed (status=124 elapsed=20s): 
